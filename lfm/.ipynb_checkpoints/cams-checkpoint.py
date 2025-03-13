@@ -471,6 +471,7 @@ class XimeaCamera(CameraBase):
     @property
     def frame_shape(self):
         '''Get shape of frame as [height, width]'''
+        
         return [self.xicam.get_height(), self.xicam.get_width()]
 
     @property
@@ -483,16 +484,18 @@ class XimeaCamera(CameraBase):
 
 class HanumatsuCamera(CameraBase):
     '''Hamamatsu DCAM camera using pydcam'''
-
+    from pyDCAM import *
     def __init__(self, conf=None):
         '''Initialize the camera'''
-        ...
+        device_count = dcamapi_init()[0] #for checking how many are connected, troubleshoot cam connection
+        self.hdcam = HDCAM(device_count)
+        self._sensor_shape = [self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_HEIGHT), self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_WIDTH)]
     
     @property
     def roi(self):
         '''Get ROI as a dictionary'''
-        ...
-
+        return self._roi
+        
     def set_roi(self, y_size=None, x_size=None, y_offset=None, x_offset=None, y_bin=1, x_bin=1):
         '''Set the Region of Interest (ROI)
         
@@ -504,7 +507,25 @@ class HanumatsuCamera(CameraBase):
             y_bin: Vertical binning factor
             x_bin: Horizontal binning factor
         '''
-        ...
+        if y_size is None:
+            y_size = self.sensor_shape[0]
+        if x_size is None:
+            x_size = self.sensor_shape[1]
+        if y_offset is None:
+            y_offset = (self.sensor_shape[0] - y_size) // 2
+        if x_offset is None:
+            x_offset = (self.sensor_shape[1] - x_size) // 2
+        #enable subarray mode
+        if [y_size, x_size] != self._sensor_shape:
+            self.hdcam.subarray_mode = True # Enable subarray mode
+            self.hdcam.subarray_size = (y_size, x_size)
+            self.hcam.subarray_pos = (y_offset,x_offset)
+        self._roi = dict(y_size=y_size, 
+                         x_size=x_size, 
+                         y_offset=y_offset, 
+                         x_offset=x_offset, 
+                         y_bin=y_bin, 
+                         x_bin=x_bin)
 
     def set_trigger(self, external=True, each_frame=True):
         '''Set trigger mode
@@ -561,12 +582,11 @@ class HanumatsuCamera(CameraBase):
     @property
     def frame_shape(self):
         '''Get the shape of frames (height, width)'''
-        ...
-
+        return [self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_HEIGHT), self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_WIDTH)]
     @property
     def sensor_shape(self):
         '''Get the full sensor resolution as (height, width)'''
-        ...
+        return self._sensor_shape
 
     def __del__(self):
         '''Clean up and close camera connection'''

@@ -300,10 +300,7 @@ class OPM:
             writer = VanillaWriter(fn=fn, name="data", dtype=stack_dtype, shape=stack_shape)
         logger.info(f"Dataset with shape {stack_shape} and dtype {stack_dtype} created in {fn}")
 
-        # set up ortho preview
-        preview_callback, imv = get_ortho_view_callback(self.cam.frame_shape, conf['scan_parameters']['y_planes'], window_title='Acquisition preview', refresh_every=conf['scan_parameters']['y_planes'])
-        pg.Qt.QtWidgets.QApplication.processEvents(pg.Qt.QtCore.QEventLoop.AllEvents, 100)
-
+        
         def interrupt():
             if not imv.isVisible():
                 self.interrupt_flag = True

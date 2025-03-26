@@ -602,8 +602,8 @@ class DCamera(CameraBase):
 
     def __init__(self, conf=None):
         '''Initialize the camera'''
-        dcamapi_init()
-        self.hdcam = dcamapi.HDCAM()
+        device_count = dcamapi_init()
+        self.hdcam = HDCAM(range(device_count)[0])
         self._roi = {}
         self._buffer_frames = 256
         self._fifo = True

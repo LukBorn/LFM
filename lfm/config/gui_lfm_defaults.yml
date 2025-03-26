@@ -1,0 +1,35 @@
+acquisition:
+  base_directory: 'D:\'
+  name_suffix: ''
+  compress: True
+  stimulus_file: ''
+  ramp_s: 0
+  recording_s: 1
+  led_percent: 10
+camera:
+  recording_fps: 300
+  gain: 1
+  cam_trig_width_ms: 0.1
+  ROI:
+    y_size: 1000
+    x_size: 2600
+    y_decenter: 0
+    x_decenter: 0
+    y_bin: 1
+    x_bin: 1
+  preview_fps: 10
+daq:
+  rate: 50000
+  device: 'Dev1'
+  ao_channels: 'ao0:2'
+  do_port: 'port0/line0'
+  shutter_line: 'port0/line3'
+  stim_channels: 'Dev2/ao0:3'
+hardware:
+  led_control_v: 1
+alignment:
+  window_size: [50, 50]
+  edge_offset: [100, 100]
+user_defined:
+  notes: ''
+  fish_orientation: [1, -1, 1]

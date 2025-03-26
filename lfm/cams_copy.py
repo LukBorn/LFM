@@ -719,13 +719,14 @@ class HanumatsuCamera(CameraBase):
         dcamapi.uninit()
 """
 from pyDCAM import dcamapi_init, HDCAM, DCAMIDPROP
-class HanumatsuCamera(CameraBase):
+class HanumatsuCamera_pyDCAM_old(CameraBase):
     '''Hamamatsu DCAM camera using pydcam'''
 
     def __init__(self, conf=None):
         '''Initialize the camera'''
         device_count = dcamapi_init()[0] #for checking how many are connected, troubleshoot cam connection
         self.hdcam = HDCAM(device_count)
+        self.sensor_shape =
     
     @property
     def roi(self):
@@ -813,23 +814,18 @@ class HanumatsuCamera(CameraBase):
     @property
     def frame_dtype(self):
         '''Get the data type of frames (e.g., uint8, uint16)'''
-        if self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_BITSPERCHANNEL) == 16.0:
-            return 16.0
-        else:
-            raise ValueError("Wow! You broke it, great job! Now rewrite the frame_dtype function :)")
+        ...
     
     @property
     def frame_shape(self):
         '''Get the shape of frames (height, width)'''
-        return [self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_SUBARRAYVPOS),
-                self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_SUBARRAYHPOS)]
+        return [self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_HEIGHT),
+                self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_WIDTH)]
     @property
     def sensor_shape(self):
         '''Get the full sensor resolution as (height, width)'''
-
-        return [self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGEDETECTOR_PIXELHEIGHT),
-                self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGEDETECTOR_PIXELWIDTH)]
-
+        return [self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_HEIGHT),
+                self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_WIDTH)]
     def __del__(self):
         '''Clean up and close camera connection'''
         ...

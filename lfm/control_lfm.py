@@ -29,8 +29,8 @@ class SimpleArrayProxy:
             slices = (slices,)
         return self._custom_getitem(slices)
 
-def get_full_waveforms(conf):
-        ''' Generate full waveforms for the entire recording, including ramping. Note this uses SimpleArrayProxy to avoid storing the entire array in memory.
+def get_full_waveforms(conf, preview= False):
+    ''' Generate full waveforms for the entire recording, including ramping. Note this uses SimpleArrayProxy to avoid storing the entire array in memory.
 
     Args:
         conf (dict): Configuration dictionary.
@@ -42,20 +42,19 @@ def get_full_waveforms(conf):
         float: Updated frame time in ms.
     '''
     fps = conf['camera']['preview_fps'] if preview else conf['camera']['recording_fps']
-    
-    assert 1000/fps >= conf['camera']['exposure_ms'], f"fps of {fps} means {1000/fps} ms per frame, which is shorter than the {conf['camera']['exposure_ms']} ms exposure time"
-    
+    frame_time = 1000/fps
+    assert frame_time >= conf['camera']['exposure_ms'], f"fps of {fps} means {frame_time} ms per frame, which is shorter than the {conf['camera']['exposure_ms']} ms exposure time"
+
     trigger_single = np.zeros(conf['daq']['rate'])
     for frame_start in range(0, conf['daq']['rate'], conf['daq']['rate']//fps):
-        trigger_single[frame_start : frame_start + int((conf['camera']['cam_trig_width_ms'] / 1000) * rate)] = 1
+        trigger_single[frame_start : frame_start + int((conf['camera']['cam_trig_width_ms'] / 1000) * conf['daq']['rate'])] = 1
 
-    
-    
+    led_single = np.ones(conf['daq']['rate'])*conf['acquisition']['led_percent']*conf["hardware"]["led_control_v"]
+
     ramp_samples = int(conf['acquisition']['ramp_seconds'] * conf['daq']['rate'])
-    recording_samples = int(conf['acquisition']['recording_seconds'] * conf['daq']['rate'])
-   
-    ramp = (1 - np.exp(-6 * np.linspace(0, 1, ramp_samples)))*conf['acquisition']['led_percent']*1 #TODO control voltage factor for LED 
-    
+
+    ramp = (1 - np.exp(-6 * np.linspace(0, 1, ramp_samples)))*conf['acquisition']['led_percent']*conf["hardware"]["led_control_v"]
+
     def led_getter(slices):
         ix = np.r_[slices[1]]
         ramp_ix = np.minimum(ix, ramp_samples - 1)
@@ -64,18 +63,17 @@ def get_full_waveforms(conf):
         led_out[ix < ramp_samples] = ramp[ramp_ix]
         led_out[ix >= ramp_samples] = led_single[record_ix]
         return led_out
-    
+
     def trigger_getter(slices):
         ix = np.maximum(np.r_[slices[1]] - ramp_samples, 0)
         return trigger_single[ix]
-    
+
     full_shape = [1, int(conf['daq']['rate'] * (conf['acquisition']['ramp_seconds'] + conf['acquisition']['recording_seconds']))]
     led_full = SimpleArrayProxy(led_getter, shape=full_shape)
     trigger_full = SimpleArrayProxy(trigger_getter, shape=full_shape)
-    
-    return led_full, trigger_full, led_single, trigger_single
 
-#TODO change 
+    return led_full, trigger_full, led_single, trigger_single, frame_time
+
 def get_preview_callback(im_shape, edge_sz=10, refresh_every=30, window_title='Preview'):
     """Return a callback function for generating an preview in an ImageView.
     
@@ -111,11 +109,13 @@ def get_preview_callback(im_shape, edge_sz=10, refresh_every=30, window_title='P
     return callback, imv
 
 
+from cams import HanumatsuCamera as Camera
+from daq import unifiedDAO
+from write import ParallelCompressedWriter, VanillaWriter
+
+
 class LFM:
-    """A class for controlling the DAQ and camera for LPM"""
-    from .cams import HanumatsuCamera as Camera
-    from .daq import unifiedDAO
-    from .write import ParallelCompressedWriter, VanillaWriter
+    """A class for controlling the DAQ and camera for LFM"""
     def __init__(self, rate=50000, aochans='Dev1/ao0:2', cam_trigger_line='port0/line0', shutter_line='PFI0', cam_gain=1):
         """Initialize OPM object.
         """
@@ -130,7 +130,8 @@ class LFM:
         self.interrupt_flag = False
 
     def point(self):
-        """Set output voltages to zero
+        """
+        Set output voltages to zero
         """
         chans = unflatten_channel_string(self.dao.ao_chans)
         self.dao.queue_data(np.zeros((len(chans), 2)), finite=True, chunked=False)
@@ -150,11 +151,11 @@ class LFM:
         """Start a preview of camera frames."""
         ao_single, do_single, ft = get_full_waveforms(conf, preview=True)
         
-        self.cam.exposure_time = conf['camera']['exposure_ms'] / 1000
+        self.cam.exposure_time = conf['camera']['preview_fps'] / 1000
         self.cam.set_trigger(True)
 
         with self.dao.queue_data(ao_single, do_single, finite=False, chunked=False):
-            self.cam.preview(fifo=False)
+            self.cam.preview(fifo=False) #TODO implement
 
         self.point()
         logger.info(f"Preview stopped")
@@ -182,7 +183,7 @@ class LFM:
 
         # collect background frame
         logger.info('Acquiring background frame...')
-        self.cam.set_trigger(False) #dont quite understand why
+        self.cam.set_trigger(False) #internal trigger because were aquiring stack not streaming data?
         bg_im = self.cam.acquire_stack(N_BACKGROUND_FRAMES)[0].mean(0, dtype='float32')
         with h5py.File(fn, 'w') as fh5:
             fh5.create_dataset("bg", data=bg_im)
@@ -194,12 +195,20 @@ class LFM:
         stack_shape = (n_frames, *self.cam.frame_shape)
         stack_dtype = 'uint8'
         if conf['acquisition']['compress']:
-            writer = ParallelCompressedWriter(fn=fn, name="data", dtype=stack_dtype, shape=stack_shape, chunk_shape=(1, 1, *self.cam.frame_shape), num_workers=8)
+            writer = ParallelCompressedWriter(fn=fn,
+                                              name="data",
+                                              dtype=stack_dtype,
+                                              shape=stack_shape,
+                                              chunk_shape=(1, 1, *self.cam.frame_shape),
+                                              num_workers=8)
         else:
-            writer = VanillaWriter(fn=fn, name="data", dtype=stack_dtype, shape=stack_shape)
+            writer = VanillaWriter(fn=fn,
+                                   name="data",
+                                   dtype=stack_dtype,
+                                   shape=stack_shape)
         logger.info(f"Dataset with shape {stack_shape} and dtype {stack_dtype} created in {fn}")
 
-        # set up ortho preview
+        # set up preview
         preview_callback, imv = get_preview_callback(self.cam.frame_shape, 
                                                      window_title='Acquisition preview',
                                                      refresh_every=30)
@@ -218,11 +227,10 @@ class LFM:
         def callback(im, ii, timestamp, frame_number):
             frame_number -= n_ramp_frames 
             if frame_number == 0:
-                logger.info(f'Starting to save at frame {n_ramp_vols * n_planes}')
+                logger.info(f'Starting to save at frame {n_ramp_frames+1}')
             if frame_number >= 0:
-                iVol, iPlane = np.unravel_index(frame_number, [n_vols, n_planes])
                 #writer.write_chunk(im[None,None], (iVol, iPlane, 0, 0))
-                writer.write_frame(im, iVol, iPlane)
+                writer.write_frame(im, frame_number)
                 tstmp[frame_number] = timestamp
                 nfrm[frame_number] = frame_number
             # if frame_number % 60 == 0:
@@ -243,7 +251,7 @@ class LFM:
         self.interrupt_flag = False
         with self.stim_dao.queue_data(self.stim_data, trigger_delay_sec=stim_delay_sec) if self.stim_dao is not None else nullcontext():
             with self.dao.queue_data(ao_full, do_full, finite=True, chunked=True), writer:
-                self.cam.stream(num_frames=(n_vols + n_ramp_vols) * n_planes, 
+                self.cam.stream(num_frames=n_ramp_frames+n_frames,
                                 callback=callback, 
                                 already_armed=True, 
                                 interrupt=interrupt)
@@ -277,7 +285,7 @@ class LFM:
                 self.stim_data = fh5['stimulus'][:]
                 name = fh5['name'][()].decode('utf-8')
                 logger.info(f"Loading stimulus {name} (shape {self.stim_data.shape} {self.stim_data.dtype}), sampled at {rate} Hz (duration: {self.stim_data.shape[1]/rate} s)" )
-                chans = unflatten_channel_string(conf['hardware']['daq']['stim_channels'])
+                chans = unflatten_channel_string(conf['daq']['stim_channels'])
                 chans = flatten_channel_string(chans[:self.stim_data.shape[0]])
                 self.stim_dao = unifiedDAO(rate, chans, parent=False)
         except:

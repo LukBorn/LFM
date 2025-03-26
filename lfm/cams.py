@@ -481,13 +481,13 @@ class XimeaCamera(CameraBase):
     def close(self):
         pass
 
-"""
 
+from pylablib.devices.DCAM import DCAMCamera
 class HanumatsuCamera(CameraBase):
     '''Hamamatsu DCAM camera using pylablib
        written by chat GPT :)
     '''
-    from pylablib.devices.DCAM import DCAMCamera
+
     def __init__(self, conf=None):
         '''Initialize the camera'''
         self.cam = DCAMCamera()
@@ -524,19 +524,19 @@ class HanumatsuCamera(CameraBase):
         if x_bin is not None:
             x_bin = roi["x_bin"]
         self.cam.set_roi(hstart=y_offset,
-                         hend=y_offset,+y_size,
+                         hend=y_offset+y_size,
                          vstart=x_offset,
-                         vend=x_offset,+x_size,
+                         vend=x_offset+x_size,
                          hbin=y_bin,
                          vbin=x_bin,) #due to library, this is ignored and always set to ybin
 
     def set_trigger(self, external=True, each_frame=True):
         '''Set trigger mode'''
         if external:
-            self.cam.set_property("trigger_source", "external")
-            self.cam.set_property("trigger_active", "rising")
+            self.cam.set_trigger_mode("ext")
+
         else:
-            self.cam.set_property("trigger_source", "internal")
+            self.cam.set_trigger_mode("int")
 
     @property
     def exposure_time(self):
@@ -573,7 +573,7 @@ class HanumatsuCamera(CameraBase):
     @property
     def frame_dtype(self):
         '''Get the data type of frames'''
-        bit_depth = self.cam.get_property("image_pixeltype")
+        bit_depth = self.cam.get_attribute_value("image_pixel_type")
         if "16" in bit_depth:
             return "uint16"
         else:
@@ -582,31 +582,28 @@ class HanumatsuCamera(CameraBase):
     @property
     def frame_shape(self):
         '''Get the shape of frames (height, width)'''
-        height = self.cam.get_property("image_height")
-        width = self.cam.get_property("image_width")
+        height = self.cam.get_attribute_value("image_height")
+        width = self.cam.get_attribute_value("image_width")
         return (int(height), int(width))
 
     @property
     def sensor_shape(self):
         '''Get the full sensor resolution as (height, width)'''
-        height = self.cam.get_property("sensor_height")
-        width = self.cam.get_property("sensor_width")
-        return (int(height), int(width))
+        return self.cam.get_detector_size()
 
     def __del__(self):
         '''Clean up and close camera connection'''
         self.cam.close()
         
 
-from pyDCAM import dcamapi, dcamprop
-class HanumatsuCamera(CameraBase):
+from pyDCAM import *
+class DCamera(CameraBase):
     '''Hamamatsu DCAM camera using pyDCAM'''
 
     def __init__(self, conf=None):
         '''Initialize the camera'''
-        dcamapi.init()
+        dcamapi_init()
         self.hdcam = dcamapi.HDCAM()
-        self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.TRIGGER_MODE, dcamprop.DCAMPROP.TRIGGER_MODE__NORMAL)
         self._roi = {}
         self._buffer_frames = 256
         self._fifo = True
@@ -645,10 +642,11 @@ class HanumatsuCamera(CameraBase):
         '''Set trigger mode'''
         if external:
             if each_frame:
-                self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.TRIGGER_MODE, dcamprop.DCAMPROP.TRIGGER_MODE__START)
+                self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.TRIGGER_MODE, dcamprop.DCAMPROP.TRIGGER_MODE__NORMAL)
                 self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.TRIGGER_SOURCE, dcamprop.DCAMPROP.TRIGGER_SOURCE__EXTERNAL)
             else:
-                logger.warning('Start trigger currently not supported')
+                self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.TRIGGER_MODE, dcamprop.DCAMPROP.TRIGGER_MODE__START)
+                self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.TRIGGER_SOURCE, dcamprop.DCAMPROP.TRIGGER_SOURCE__EXTERNAL)
         else:
             self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.TRIGGER_MODE, dcamprop.DCAMPROP.TRIGGER_MODE__NORMAL)
             self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.TRIGGER_SOURCE, dcamprop.DCAMPROP.TRIGGER_SOURCE__INTERNAL)
@@ -656,7 +654,7 @@ class HanumatsuCamera(CameraBase):
     @property
     def exposure_time(self):
         '''Get the exposure time (in seconds)'''
-        return self.hdcam.dcamprop_getvalue(dcamprop.DCAM_IDPROP.EXPOSURETIME)
+        return self.hdcam.dcamprop_getvalue(dcamprop.DCAM_IDPROP.EXPOSURETIME) * 1e6
 
     @exposure_time.setter
     def exposure_time(self, t):
@@ -695,9 +693,21 @@ class HanumatsuCamera(CameraBase):
         '''Get the data type of frames (e.g., uint8, uint16)'''
         bit_depth = self.hdcam.dcamprop_getvalue(dcamprop.DCAM_IDPROP.IMAGE_PIXELTYPE)
         if bit_depth == dcamprop.DCAMPROP.IMAGE_PIXELTYPE__MONO16:
-            return 'uint16'
+            return np.uint16
+        elif bit_depth == dcamprop.DCAMPROP.IMAGE_PIXELTYPE__MONO8:
+            return np.uint8
+        else: #12bit
+            self.frame_dtype = np.uint8
+            return np.uint8
+
+    @frame_dtype.setter
+    def frame_dtype(self, dtype):
+        if dtype == np.uint8:
+            self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.IMAGE_PIXELTYPE, dcamprop.DCAMPROP.IMAGE_PIXELTYPE__MONO8)
+        elif dtype == np.uint16:
+            self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.IMAGE_PIXELTYPE, dcamprop.DCAMPROP.IMAGE_PIXELTYPE__MONO16)
         else:
-            return 'uint8'
+            print("dtype not supported idiont")
 
     @property
     def frame_shape(self):
@@ -709,130 +719,16 @@ class HanumatsuCamera(CameraBase):
     @property
     def sensor_shape(self):
         '''Get the full sensor resolution as (height, width)'''
-        height = int(self.hdcam.dcamprop_getvalue(dcamprop.DCAM_IDPROP.IMAGE_HEIGHT))
-        width = int(self.hdcam.dcamprop_getvalue(dcamprop.DCAM_IDPROP.IMAGE_WIDTH))
-        return (height, width)
+
+        return [self.hdcam.dcamprop_getvalue(dcamprop.DCAM_IDPROP_IMAGEDETECTOR_PIXELHEIGHT),
+                self.hdcam.dcamprop_getvalue(dcamprop.DCAM_IDPROP_IMAGEDETECTOR_PIXELWIDTH)]
 
     def __del__(self):
         '''Clean up and close camera connection'''
         self.hdcam.dcamdev_close()
         dcamapi.uninit()
-"""
-from pyDCAM import dcamapi_init, HDCAM, DCAMIDPROP
-class HanumatsuCamera(CameraBase):
-    '''Hamamatsu DCAM camera using pydcam'''
 
-    def __init__(self, conf=None):
-        '''Initialize the camera'''
-        device_count = dcamapi_init()[0] #for checking how many are connected, troubleshoot cam connection
-        self.hdcam = HDCAM(device_count)
-    
-    @property
-    def roi(self):
-        '''Get ROI as a dictionary'''
-        return self._roi
-        
-    def set_roi(self, y_size=None, x_size=None, y_offset=None, x_offset=None, y_bin=1, x_bin=1):
-        '''Set the Region of Interest (ROI)
-        
-        Args:
-            y_size: Height of ROI
-            x_size: Width of ROI
-            y_offset: Y offset of ROI
-            x_offset: X offset of ROI
-            y_bin: Vertical binning factor
-            x_bin: Horizontal binning factor
-        '''
-        if y_size is None:
-            y_size = self.sensor_shape[0]
-        if x_size is None:
-            x_size = self.sensor_shape[1]
-        if y_offset is None:
-            y_offset = (self.sensor_shape[0] - y_size) // 2
-        if x_offset is None:
-            x_offset = (self.sensor_shape[1] - x_size) // 2
-        #enable subarray mode
-        if [y_size, x_size] != self.sensor_shape:
-            self.hdcam.subarray_mode = True # Enable subarray mode
-            self.hdcam.subarray_size = (y_size, x_size)
-            self.hdcam.subarray_pos = (y_offset,x_offset)
-        self._roi = dict(y_size=y_size, 
-                         x_size=x_size, 
-                         y_offset=y_offset, 
-                         x_offset=x_offset, 
-                         y_bin=y_bin, 
-                         x_bin=x_bin)
 
-    def set_trigger(self, external=True, each_frame=True):
-        '''Set trigger mode
-        
-        Args:
-            external: True for external trigger, False for internal
-            each_frame: True to trigger each frame, False for trigger on first frame
-        '''
-        ...
-
-    @property
-    def exposure_time(self):
-        '''Get the exposure time (in seconds)'''
-        ...
-    
-    @exposure_time.setter
-    def exposure_time(self, t):
-        '''Set the exposure time (in seconds)
-        
-        Args:
-            t: Exposure time in seconds
-        '''
-        ...
-
-    def arm(self, stream_to_disk_path=None, fifo=True):
-        '''Start acquisition (live mode)
-        
-        Args:
-            stream_to_disk_path: Path to save the streamed data
-            fifo: Whether to use FIFO mode
-        '''
-        ...
-    
-    def disarm(self):
-        '''Stop acquisition'''
-        ...
-
-    def poll_frame(self, copy=False):
-        '''Retrieve a frame from the camera
-        
-        Args:
-            copy: True to return a copy, False to return a reference
-        
-        Returns:
-            Tuple (image_data, timestamp, frame_count)
-        '''
-        ...
-
-    @property
-    def frame_dtype(self):
-        '''Get the data type of frames (e.g., uint8, uint16)'''
-        if self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_BITSPERCHANNEL) == 16.0:
-            return 16.0
-        else:
-            raise ValueError("Wow! You broke it, great job! Now rewrite the frame_dtype function :)")
-    
-    @property
-    def frame_shape(self):
-        '''Get the shape of frames (height, width)'''
-        return [self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_SUBARRAYVPOS),
-                self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_SUBARRAYHPOS)]
-    @property
-    def sensor_shape(self):
-        '''Get the full sensor resolution as (height, width)'''
-
-        return [self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGEDETECTOR_PIXELHEIGHT),
-                self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGEDETECTOR_PIXELWIDTH)]
-
-    def __del__(self):
-        '''Clean up and close camera connection'''
-        ...
 
 
 class FrameQueue():

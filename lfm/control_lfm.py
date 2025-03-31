@@ -183,7 +183,7 @@ class LFM:
 
         # collect background frame
         logger.info('Acquiring background frame...')
-        self.cam.set_trigger(False) #internal trigger because were aquiring stack not streaming data?
+        self.cam.set_trigger(external=False, each_frame=True) #internal trigger because were aquiring stack not streaming data?
         bg_im = self.cam.acquire_stack(N_BACKGROUND_FRAMES)[0].mean(0, dtype='float32')
         with h5py.File(fn, 'w') as fh5:
             fh5.create_dataset("bg", data=bg_im)
@@ -238,8 +238,8 @@ class LFM:
             preview_callback(im, ii, timestamp, frame_number)
 
         # start camera acquisition
-        self.cam.exposure_time = conf['camera']['exposure_ms'] / 1000
-        self.cam.set_trigger(True)
+        self.cam.exposure_time = conf['camera']['exposure_ms'] * 1000
+        self.cam.set_trigger(external=True, each_frame=False)
         self.cam.arm()
 
         # setup DAQ

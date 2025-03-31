@@ -10,13 +10,13 @@ camera:
   recording_fps: 300
   gain: 1
   cam_trig_width_ms: 0.1
-  ROI:
-    y_size: 1000
-    x_size: 2600
+  ROI: #only in steps of 4
+    y_size: 2048
+    x_size: 2048
     y_decenter: 0
     x_decenter: 0
     y_bin: 1
-    x_bin: 1
+    x_bin: 1 #=y_bin
   preview_fps: 10
 daq:
   rate: 50000

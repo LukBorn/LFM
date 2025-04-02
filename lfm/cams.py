@@ -598,7 +598,9 @@ class HanumatsuCamera(CameraBase):
 
 from pyDCAM import dcamapi_init, HDCAM, DCAMIDPROP, DCAMPROPMODEVALUE, dcamapi_uninit
 class DCamera(CameraBase):
-    '''Hamamatsu DCAM camera using pyDCAM'''
+    '''Hamamatsu DCAM camera using pyDCAM
+       C:/Users/jlab/Desktop/dcam/dcamsdk4/doc/camera_properties/propC13440-20CU_en.html
+    '''
 
     def __init__(self, conf=None):
         '''Initialize the camera'''
@@ -606,6 +608,7 @@ class DCamera(CameraBase):
         self.hdcam = HDCAM(range(device_count)[0])
         #self.hdcam.readout_speed = DCAMPROPMODEVALUE.DCAMPROP_READOUTSPEED__SLOWEST
         self._buffer_frames = 256
+        self._sensor_shape = self.frame_shape
         self._fifo = True
         self._last_frame = None
 
@@ -657,17 +660,17 @@ class DCamera(CameraBase):
         '''Set trigger mode'''
         if external:
             if each_frame:
-                self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGER_MODE,  DCAMPROPMODEVALUE.DCAMPROP_TRIGGER_MODE__NORMAL)
-                self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGER_SOURCE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGERSOURCE__EXTERNAL)
-                self.trigger = "ext_eachframe"
+                self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGER_MODE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGER_MODE__NORMAL)
+                self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGERSOURCE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGERSOURCE__EXTERNAL)
+                self.trigger = "External EachFrame"
             else:
                 self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGER_MODE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGER_MODE__START)
-                self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGER_SOURCE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGERSOURCE__EXTERNAL)
-                self.trigger = "ext_cont"
+                self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGERSOURCE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGERSOURCE__EXTERNAL)
+                self.trigger = "External Start"
         else:
             self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGER_MODE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGER_MODE__NORMAL)
-            self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGER_SOURCE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGERSOURCE__INTERNAL)
-            self.trigger = "int"
+            self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGERSOURCE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGERSOURCE__INTERNAL)
+            self.trigger = "Internal"
 
     @property
     def exposure_time(self):
@@ -682,10 +685,10 @@ class DCamera(CameraBase):
     def arm(self, stream_to_disk_path=None, fifo=True):
         '''Start acquisition (live mode)'''
         self.hdcam.dcambuf_alloc(self._buffer_frames)
-        if self.trigger[0] =="e":
+        if self.trigger[0] =="E": #external trigger 
             hwait = self.hdcam.dcamwait_open()
         self.hdcam.dcamcap_start(DCAMCAP_START_SEQUENCE)
-        if self.trigger[0] == "e":
+        if self.trigger[0] == "E":
             hwait.dcamwait_start()
         self._fifo = fifo
         self._last_frame = None
@@ -714,20 +717,20 @@ class DCamera(CameraBase):
     def frame_dtype(self):
         '''Get the data type of frames (e.g., uint8, uint16)'''
         bit_depth = self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_PIXELTYPE)
-        if bit_depth == DCAMPROPMODEVALUE.DCAMPROP.IMAGE_PIXELTYPE__MONO16:
-            return np.uint16
-        elif bit_depth == DCAMPROPMODEVALUE.DCAMPROP.IMAGE_PIXELTYPE__MONO8:
-            return np.uint8
-        else: #12bit
-            self.frame_dtype = np.uint8
-            return np.uint8
+        if bit_depth == 2.:
+            return "uint16"
+        elif bit_depth == 1.:
+            return "uint8"
+        elif bit_depth == 3.: #12bit
+            self.frame_dtype = "uint8"
+            return "uint8"
 
     @frame_dtype.setter
     def frame_dtype(self, dtype):
-        if dtype == np.uint8:
-            self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_PIXELTYPE,DCAMPROPMODEVALUE.DCAMPROP.IMAGE_PIXELTYPE__MONO8)
-        elif dtype == np.uint16:
-            self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_PIXELTYPE, DCAMPROPMODEVALUE.DCAMPROP.IMAGE_PIXELTYPE__MONO16)
+        if dtype == "uint8":
+            self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_PIXELTYPE, 1.)
+        elif dtype == "uint16":
+            self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_PIXELTYPE, 2.)
         else:
             print("dtype not supported idiont")
 
@@ -742,13 +745,16 @@ class DCamera(CameraBase):
     def sensor_shape(self):
         '''Get the full sensor resolution as (height, width)'''
 
-        return [int(self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGEDETECTOR_PIXELHEIGHT)),
-                int(self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGEDETECTOR_PIXELWIDTH))]
+        return self._sensor_shape
 
-    def __del__(self):
+    def close():
         '''Clean up and close camera connection'''
         self.hdcam.dcamdev_close()
         dcamapi_uninit()
+        
+    def __del__(self):
+        '''Clean up and close camera connection'''
+        self.close()
 
 
 

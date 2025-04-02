@@ -152,7 +152,7 @@ class LFM:
         ao_single, do_single, ft = get_full_waveforms(conf, preview=True)
         
         self.cam.exposure_time = conf['camera']['preview_fps'] / 1000
-        self.cam.set_trigger(True)
+        self.cam.set_trigger(external=True,each_frame=True)
 
         with self.dao.queue_data(ao_single, do_single, finite=False, chunked=False):
             self.cam.preview(fifo=False) #TODO implement

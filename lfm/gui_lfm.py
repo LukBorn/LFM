@@ -236,7 +236,6 @@ if __name__ == "__main__":
             di["camera"]["ROI"]["y_bin"],
             di["camera"]["ROI"]["x_bin"],
         )
-        lfm.cam.exposure_time = di["camera"]["exposure_ms"] / 1000
         setOptsRecursive(di.p, enabled=False)
         if name == "preview":
             lfm.start_preview(di.to_dict())

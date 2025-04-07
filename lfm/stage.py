@@ -1,233 +1,139 @@
-# sutterMP285 : A python class for using the Sutter MP-285 positioner
-#
-# SUTTERMP285 implements a class for working with a Sutter MP-285
-#   micro-positioner. The Sutter must be connected with a Serial
-#   cable.
-#
-# This class uses the python "serial" package which allows for
-#   with serial devices through 'write' and 'read'.
-#   The communication properties (BaudRate, Terminator, etc.) are
-#   set when invoking the serial object with serial.Serial(..) (l105,
-#   see Sutter Reference manual p23).
-#
-# Methods:
-#   Create the object. The object is opened with serial.Serial and the connection
-#     is tested to verify that the Sutter is responding.
-#       obj = sutterMP285()
-#
-#   Update the position display on the instrument panel (VFD)
-#       updatePanel()
-#
-#   Get the status information (step multiplier, velocity, resolution)
-#       [stepMult, currentVelocity, vScaleFactor] = getStatus()
-#
-#   Get the current absolute position in um
-#       xyz_um = getPosition()
-#
-#   Set the move velocity in steps/sec. vScaleFactor = 10|50 (default 10).
-#       setVelocity(velocity, vScaleFactor)
-#
-#   Move to a specified position in um [x y z]. Returns the elapsed time
-#     for the move (command sent and acknowledged) in seconds.
-#       moveTime = gotoPosition(xyz)
-#
-#   Set the current position to be the new origin (0,0,0)
-#       setOrigin()
-#
-#   Reset the instrument
-#       sendReset()
-#
-#   Close the connetion
-#       __del__()
-#
-# Properties:
-#   verbose - The level of messages displayed (0 or 1). Default 1.
-#
-#
-# Example:
-#
-# >> import serial
-# >> from sutterMP285_1 import *
-# >> sutter = sutterMP285()
-#   Serial<id=0x4548370, open=True>(port='COM1', baudrate=9600, bytesize=8, parity='N', stopbits=1, timeout=30, xonxoff=False, rtscts=False, dsrdtr=False)
-#   sutterMP285: get status info
-#   (64, 0, 2, 4, 7, 0, 99, 0, 99, 0, 20, 0, 136, 19, 1, 120, 112, 23, 16, 39, 80, 0, 0, 0, 25, 0, 4, 0, 200, 0, 84, 1)
-#   step_mul (usteps/um): 25
-#   xspeed" [velocity] (usteps/sec): 200
-#   velocity scale factor (usteps/step): 10
-#   sutterMP285 ready
-# >> pos = sutter.getPosition()
-#   sutterMP285 : Stage position
-#   X: 3258.64 um
-#   Y: 5561.32 um
-#   Z: 12482.5 um
-# >> posnew = (pos[0]+10.,pos[1]+10.,pos[2]+10.)
-# >> sutter.gotoPosition(posnew)
-#   sutterMP285: Sutter move completed in (0.24 sec)
-# >> status = sutter.getStatus()
-#   sutterMP285: get status info
-#   (64, 0, 2, 4, 7, 0, 99, 0, 99, 0, 20, 0, 136, 19, 1, 120, 112, 23, 16, 39, 80, 0, 0, 0, 25, 0, 4, 0, 200, 0, 84, 1)
-#   step_mul (usteps/um): 25
-#   xspeed" [velocity] (usteps/sec): 200
-#   velocity scale factor (usteps/step): 10
-# >> del sutter
-#
-#
-
-import serial
-import struct
+import pathlib
+import os
 import time
-import sys
-from numpy import *
+import libximc.highlevel as ximc
+import numpy as np
 
 
-class sutterMP285:
-    'Class which allows interaction with the Sutter Manipulator 285'
+from opm_acquire.stage import sutterMP285
+#TODO implement SutterStage() with the same functions as StandaStage()
 
-    def __init__(self,com):
-        self.verbose = 1.  # level of messages
-        self.timeOut = 30  # timeout in sec
-        # initialize serial connection to controller
-        try:
-            self.ser = serial.Serial(port=com, baudrate=9600, bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
-                                     stopbits=serial.STOPBITS_ONE, timeout=self.timeOut)
-            self.connected = 1
-            if self.verbose:
-                print(self.ser)
-        except serial.SerialException:
-            print('No connection to Sutter MP-285 could be established!')
-            sys.exit(1)
+def get_virtual_axes(n):
+    uris = {}
+    for i in range(n):
+        virtual_device_filename = f"virtual_motor_controller_{i+1}.bin"
+        virtual_device_file_path = os.path.join(
+            pathlib.Path().cwd(),
+            virtual_device_filename
+        )
+        uris[f'VirtualAxis {i+1}'] = f"xi-emu:{virtual_device_file_path}"
+    return uris
 
-        # set move velocity to 200
-        self.setVelocity(200, 10)
-        self.updatePanel()  # update controller panel
-        print("StepMult is set to 25 !")
-        self.stepMult = 25
-        (stepM, currentV, vScaleF) = self.getStatus()
+def get_connected_axes(virtual=0):
+    """
+    returns list of device URIs. returns virtual one if none are connected
+    """
+    uris = {}
+    devices = ximc.enumerate_devices(
+        ximc.EnumerateFlags.ENUMERATE_NETWORK |
+        ximc.EnumerateFlags.ENUMERATE_PROBE
+    )
 
+    if len(devices) == 0:
+        print("No devices were found. A virtual device will be used.")
+        virtual_device_filename = "virtual_motor_controller_1.bin"
+        virtual_device_file_path = os.path.join(
+            pathlib.Path().cwd(),
+            virtual_device_filename
+        )
+        uris['VirtualAxis 1'] = f"xi-emu:{virtual_device_file_path}"
+    else:
+        print("Found {} real device(s):".format(len(devices)))
+        for device in devices:
+            print("  {}".format(device))
+            uris[device["ControllerName"]] = device["uri"]
+    return uris
 
-        if currentV == 200:
-            print('sutterMP285 ready')
+class StandaStage:
+    def __init__(self, uris, calibration = [.0025, .0025, .005], verbose=True, overshoot=0.001):
+        """
+        Class for controlling the StandaStage
+
+        """
+        self.verbose = verbose
+        if set(uris.keys()) == {'Axis 1', 'Axis 2', 'Axis 3'}:
+            self.axis1 = ximc.Axis(uris["Axis 1"]) #x
+            self.axis2 = ximc.Axis(uris["Axis 2"]) #y
+            self.axis3 = ximc.Axis(uris["Axis 3"]) #z
+            self.axes = [self.axis1, self.axis2,self.axis3]
+
         else:
-            print('sutterMP285: WARNING Sutter did not respond at startup.')
-    # destructor
+            self.axes = []
+            for axis_name, uri in uris.items():
+                clean_name = axis_name.lower().replace(" ", "")
+                setattr(self, clean_name, ximc.Axis(uri))
+                self.axes.append(getattr(self, clean_name))
+
+        for i,axis in enumerate(self.axes):
+            axis.open_device()
+            axis.set_calb(calibration[i],axis.get_engine_settings().MicrostepMode)
+        self.overshoot = overshoot
+
     def __del__(self):
-        self.ser.close()
+        for axis in self.axes:
+            axis.close_device()
+
+    def close(self):
+        for axis in self.axes:
+            axis.close_device()
+
+    def get_position(self):
+        pos = [axis.get_position_calb().Position for axis in self.axes]
         if self.verbose:
-            print('Connection to Sutter MP-285 closed')
+            print(f'Current Position: {[f"{p} mm" for p in pos]} (x,y,z)')
+        return pos
 
-    def getPosition(self):
-        # send commend to get position
-        self.ser.write(b'c\r')
-        # read position from controller
-        xyzb = self.ser.read(13)
-        # convert bytes into 'signed long' numbers
-        xyz_um = array(struct.unpack('lll', xyzb[:12])) / self.stepMult
-
+    def set_origin(self):
         if self.verbose:
-            print('sutterMP285 : Stage position ')
-            print('X: %g um \n Y: %g um\n Z: %g um' % (xyz_um[0], xyz_um[1], xyz_um[2]))
+            print(f'Setting origin...')
+        _ = self.get_position()
+        for axis in self.axes:
+            axis.command_zero()
 
-        return xyz_um
+    def move(self, relative_position):
+        assert len(relative_position) == len(self.axes), "input must have same shape as .axes"
+        for i,axis in enumerate(self.axes):
+            if relative_position[i] != 0:
+                overshoot = self.overshoot * np.sign(relative_position[i])
+                start_time = time.time()
+                axis.command_movr_calb(relative_position[i]+overshoot)
+                axis.command_wait_for_stop(10)
+                axis.command_movr_calb(-overshoot)
+            if self.verbose:
+                print(f"Finished moving axis{i} after {((time.time() - start_time) * 1000):.2f} ms")
+            self.get_position()
 
-    # Moves the three axes to specified location.
-    def gotoPosition(self, pos):
-        if len(pos) != 3:
-            print('Length of position argument has to be three')
-            sys.exit(1)
-        xyzb = struct.pack('lll', int(pos[0] * self.stepMult), int(pos[1] * self.stepMult),
-                           int(pos[2] * self.stepMult))  # convert integer values into bytes
-        startt = time.time()  # start timer
-        self.ser.write(
-            b'm' + xyzb + b'\r')  # send position to controller; add the "m" and the CR to create the move command
-        cr = []
-        cr = self.ser.read(1)  # read carriage return and ignore
-        endt = time.time()  # stop timer
-        if len(cr) == 0:
-            print('Sutter did not finish moving before timeout (%d sec).' % self.timeOut)
-        else:
-            print('sutterMP285: Sutter move completed in (%.2f sec)' % (endt - startt))
+    def move_to(self, new_position):
+        assert len(new_position) == len(self.axes), "input must have same shape as .axes"
+        for i,axis in enumerate(self.axes):
+            if new_position[i] != 0:
+                overshoot = self.overshoot * np.sign(new_position[i])
+                start_time = time.time()
+                axis.command_move_calb(new_position[i])
+                axis.command_wait_for_stop(10)
+                axis.command_movr_calb(-overshoot)
+            if self.verbose:
+                print(f"Finished moving axis {i} after {((time.time() - start_time) * 1000):.2f} ms")
+            self.get_position()
 
-    # this function changes the velocity of the sutter motions
-    def setVelocity(self, Vel, vScalF=10):
-        # Change velocity command 'V'xxCR where xx= unsigned short (16bit) int velocity
-        # set by bits 14 to 0, and bit 15 indicates ustep resolution  0=10, 1=50 uSteps/step
-        # V is ascii 86
-        # convert velocity into unsigned short - 2-byte - integeter
-        velb = struct.pack('H', int(Vel))
-        # change last bit of 2nd byte to 1 for ustep resolution = 50
-        if vScalF == 50:
-            velb2 = double(struct.unpack('B', velb[1])) + 128
-            velb = velb[0] + struct.pack('B', velb2)
-        self.ser.write(b'V' + velb + b'\r')
-        self.ser.read(1)
-
-    # Update Panel
-    # causes the Sutter to display the XYZ info on the front panel
-    def updatePanel(self):
-        self.ser.write(b'n\r')  # Sutter replies with a CR
-        self.ser.read(1)  # read and ignore the carriage return
-
-    ## Set Origin
-    # sets the origin of the coordinate system to the current position
-    def setOrigin(self):
-        self.ser.write(b'o\r')  # Sutter replies with a CR
-        self.ser.read(1)  # read and ignor the carrage return
-
-    # Reset controller
-    def sendReset(self):
-        self.ser.write(b'r\r')  # Sutter does not reply
-
-    # Queries the status of the controller.
-    def getStatus(self):
+    def get_velocity(self):
+        print("Warning: doesnt work for some reason")
+        vel = [axis.get_move_settings_calb().Speed for axis in self.axes]
         if self.verbose:
-            print('sutterMP285: get status info')
-        self.ser.write(b's\r')  # send status command
-        rrr = self.ser.read(32)  # read return of 32 bytes without carriage return
-        self.ser.read(1)  # read and ignore the carriage return
-        rrr
-        statusbytes = struct.unpack(32 * 'B', rrr)
-        print(statusbytes)
-        # the value of STEP_MUL ("Multiplier yields msteps/nm") is at bytes 25 & 26
-        #self.stepMult = double(statusbytes[25]) * 256 + double(statusbytes[24])
+            print(f'Current Velocity: {[f"{v} mm/s" for i,v in vel]} (xyz)')
+        return vel
 
-        # the value of "XSPEED"  and scale factor is at bytes 29 & 30
-        if statusbytes[29] > 127:
-            self.vScaleFactor = 50
-        else:
-            self.vScaleFactor = 10
-        # print double(127 & statusbytes[29])*256
-        # print double(statusbytes[28]), statusbytes[28]
-        # print double(statusbytes[29]), statusbytes[29]
-        self.currentVelocity = double(127 & statusbytes[29]) * 256 + double(statusbytes[28])
-        # vScaleFactor = struct.unpack('lll', rrr[30:31])
-        if self.verbose:
-            print('step_mul (usteps/um): %g' % self.stepMult)
-            print('xspeed" [velocity] (usteps/sec): %g' % self.currentVelocity)
-            print('velocity scale factor (usteps/step): %g' % self.vScaleFactor)
-        #
-        return (self.stepMult, self.currentVelocity, self.vScaleFactor)
+    def set_velocity(self, new_velocity):
+        assert len(new_velocity) == len(self.axes), "input must have same shape as .axes"
+        for i,axis in enumerate(self.axes):
+            move_settings = axis.get_move_settings_calb()
+            if self.verbose:
+                print(f'Setting velocity for axis {i} from {move_settings.Speed}mm/s to {new_velocity[i]}mm/s')
+            move_settings.Speed = new_velocity[i]
+            axis.set_move_settings_calb(move_settings)
 
-#
-# The MIT License (MIT)
-#
-# Copyright (c) 2014 Michael Graupner
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
+    def adjust_velocity(self, velocity_factors):
+        assert len(velocity_factors) == len(self.axes), "input must have same shape as .axes"
+        vel = self.get_velocity()
+        new_vel = [vel[i] * velocity_factors[i] for i in range(len(vel))]
+        self.set_velocity(new_vel)

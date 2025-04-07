@@ -103,7 +103,7 @@ def dcam_live_capturing(iDevice=0):
     if Dcamapi.init():
         dcam = Dcam(iDevice)
         if dcam.dev_open():
-            if dcam.buf_alloc(3):
+            if dcam.buf_alloc(256):
                 # th = threading.Thread(target=dcamtest_thread_live, args=(dcam,))
                 # th.start()
                 # th.join()

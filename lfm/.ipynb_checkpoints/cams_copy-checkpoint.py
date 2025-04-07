@@ -481,13 +481,13 @@ class XimeaCamera(CameraBase):
     def close(self):
         pass
 
+"""
 
-from pylablib.devices.DCAM import DCAMCamera
 class HanumatsuCamera(CameraBase):
     '''Hamamatsu DCAM camera using pylablib
        written by chat GPT :)
     '''
-
+    from pylablib.devices.DCAM import DCAMCamera
     def __init__(self, conf=None):
         '''Initialize the camera'''
         self.cam = DCAMCamera()
@@ -524,19 +524,19 @@ class HanumatsuCamera(CameraBase):
         if x_bin is not None:
             x_bin = roi["x_bin"]
         self.cam.set_roi(hstart=y_offset,
-                         hend=y_offset+y_size,
+                         hend=y_offset,+y_size,
                          vstart=x_offset,
-                         vend=x_offset+x_size,
+                         vend=x_offset,+x_size,
                          hbin=y_bin,
                          vbin=x_bin,) #due to library, this is ignored and always set to ybin
 
     def set_trigger(self, external=True, each_frame=True):
         '''Set trigger mode'''
         if external:
-            self.cam.set_trigger_mode("ext")
-
+            self.cam.set_property("trigger_source", "external")
+            self.cam.set_property("trigger_active", "rising")
         else:
-            self.cam.set_trigger_mode("int")
+            self.cam.set_property("trigger_source", "internal")
 
     @property
     def exposure_time(self):
@@ -573,7 +573,7 @@ class HanumatsuCamera(CameraBase):
     @property
     def frame_dtype(self):
         '''Get the data type of frames'''
-        bit_depth = self.cam.get_attribute_value("image_pixel_type")
+        bit_depth = self.cam.get_property("image_pixeltype")
         if "16" in bit_depth:
             return "uint16"
         else:
@@ -582,115 +582,91 @@ class HanumatsuCamera(CameraBase):
     @property
     def frame_shape(self):
         '''Get the shape of frames (height, width)'''
-        height = self.cam.get_attribute_value("image_height")
-        width = self.cam.get_attribute_value("image_width")
+        height = self.cam.get_property("image_height")
+        width = self.cam.get_property("image_width")
         return (int(height), int(width))
 
     @property
     def sensor_shape(self):
         '''Get the full sensor resolution as (height, width)'''
-        return self.cam.get_detector_size()
+        height = self.cam.get_property("sensor_height")
+        width = self.cam.get_property("sensor_width")
+        return (int(height), int(width))
 
     def __del__(self):
         '''Clean up and close camera connection'''
         self.cam.close()
         
 
-from pyDCAM import dcamapi_init, HDCAM, DCAMIDPROP, DCAMPROPMODEVALUE, dcamapi_uninit
-class DCamera(CameraBase):
-    '''Hamamatsu DCAM camera using pyDCAM
-       C:/Users/jlab/Desktop/dcam/dcamsdk4/doc/camera_properties/propC13440-20CU_en.html
-    '''
+from pyDCAM import dcamapi, dcamprop
+class HanumatsuCamera(CameraBase):
+    '''Hamamatsu DCAM camera using pyDCAM'''
 
     def __init__(self, conf=None):
         '''Initialize the camera'''
-        device_count = dcamapi_init()
-        self.hdcam = HDCAM(range(device_count)[0])
-        #self.hdcam.readout_speed = DCAMPROPMODEVALUE.DCAMPROP_READOUTSPEED__SLOWEST
-        self.set_trigger(external = False)
+        dcamapi.init()
+        self.hdcam = dcamapi.HDCAM()
+        self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.TRIGGER_MODE, dcamprop.DCAMPROP.TRIGGER_MODE__NORMAL)
+        self._roi = {}
         self._buffer_frames = 256
-        self._sensor_shape = self.frame_shape
         self._fifo = True
         self._last_frame = None
 
     @property
     def roi(self):
         '''Get ROI as a dictionary'''
-        y_size, x_size = self.hdcam.subarray_size
-        y_offset, x_offset = self.hdcam.subarray_pos
-        bin = self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_BINNING)
-        match bin:
-            case DCAMPROPMODEVALUE.DCAMPROP_BINNING__1:
-                binning=1
-            case DCAMPROPMODEVALUE.DCAMPROP_BINNING__2:
-                binning = 2
-            case DCAMPROPMODEVALUE.DCAMPROP_BINNING__4:
-                binning = 4
+        return self._roi
 
-        return dict(y_size= y_size,
-                    x_size= x_size,
-                    y_offset= y_offset,
-                    x_offset= x_offset,
-                    y_bin= binning,
-                    x_bin= binning)
-
-    def set_roi(self, y_size=None, x_size=None, y_offset=0, x_offset=0, y_bin:int=1, x_bin:int=1):
+    def set_roi(self, y_size=None, x_size=None, y_offset=None, x_offset=None, y_bin=1, x_bin=1):
         '''Set the Region of Interest (ROI)'''
-        if y_size is None:
-            y_size = self.sensor_shape[0]
-        if x_size is None:
-            x_size = self.sensor_shape[1]
-        if [(y_size, x_size), y_offset, x_offset] == [self.sensor_shape, 0,0]:
-            self.hdcam.subarray_mode = False
-        else:
-            self.hdcam.subarray_mode = True
-            self.hdcam.subarray_size = (y_size, x_size)
-            self.hdcam.subarray_pos = (y_offset,x_offset)
-
-        assert x_bin == y_bin, "only symmetric binning is supported: y_bin must == x_bin"
-        match y_bin:
-            case 1:
-                self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_BINNING, DCAMPROPMODEVALUE.DCAMPROP_BINNING__1)
-            case 2:
-                self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_BINNING, DCAMPROPMODEVALUE.DCAMPROP_BINNING__2)
-            case 4:
-                self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_BINNING, DCAMPROPMODEVALUE.DCAMPROP_BINNING__4)
-
+        # Assuming the camera supports setting ROI through properties
+        if y_size is not None:
+            self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.IMAGE_HEIGHT, y_size)
+        if x_size is not None:
+            self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.IMAGE_WIDTH, x_size)
+        if y_offset is not None:
+            self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.IMAGE_TOP, y_offset)
+        if x_offset is not None:
+            self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.IMAGE_LEFT, x_offset)
+        if y_bin is not None:
+            self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.BINNING, y_bin)
+        if x_bin is not None:
+            self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.BINNING, x_bin)
+        self._roi = {
+            'y_size': y_size,
+            'x_size': x_size,
+            'y_offset': y_offset,
+            'x_offset': x_offset,
+            'y_bin': y_bin,
+            'x_bin': x_bin
+        }
 
     def set_trigger(self, external=True, each_frame=True):
         '''Set trigger mode'''
         if external:
             if each_frame:
-                self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGER_MODE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGER_MODE__NORMAL)
-                self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGERSOURCE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGERSOURCE__EXTERNAL)
-                self.trigger = "External EachFrame"
+                self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.TRIGGER_MODE, dcamprop.DCAMPROP.TRIGGER_MODE__START)
+                self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.TRIGGER_SOURCE, dcamprop.DCAMPROP.TRIGGER_SOURCE__EXTERNAL)
             else:
-                self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGER_MODE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGER_MODE__START)
-                self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGERSOURCE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGERSOURCE__EXTERNAL)
-                self.trigger = "External Start"
+                logger.warning('Start trigger currently not supported')
         else:
-            self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGER_MODE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGER_MODE__NORMAL)
-            self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_TRIGGERSOURCE, DCAMPROPMODEVALUE.DCAMPROP_TRIGGERSOURCE__INTERNAL)
-            self.trigger = "Internal"
+            self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.TRIGGER_MODE, dcamprop.DCAMPROP.TRIGGER_MODE__NORMAL)
+            self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.TRIGGER_SOURCE, dcamprop.DCAMPROP.TRIGGER_SOURCE__INTERNAL)
 
     @property
     def exposure_time(self):
         '''Get the exposure time (in seconds)'''
-        return self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_EXPOSURETIME)
+        return self.hdcam.dcamprop_getvalue(dcamprop.DCAM_IDPROP.EXPOSURETIME)
 
     @exposure_time.setter
     def exposure_time(self, t):
         '''Set the exposure time (in seconds)'''
-        self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_EXPOSURETIME, t)
+        self.hdcam.dcamprop_setvalue(dcamprop.DCAM_IDPROP.EXPOSURETIME, t)
 
     def arm(self, stream_to_disk_path=None, fifo=True):
         '''Start acquisition (live mode)'''
         self.hdcam.dcambuf_alloc(self._buffer_frames)
-        if self.trigger[0] =="E": #external trigger 
-            hwait = self.hdcam.dcamwait_open()
-        self.hdcam.dcamcap_start()
-        if self.trigger[0] == "E":
-            hwait.dcamwait_start()
+        self.hdcam.dcamcap_start(dcamapi.DCAMCAP_START.SEQUENCE)
         self._fifo = fifo
         self._last_frame = None
 
@@ -717,47 +693,142 @@ class DCamera(CameraBase):
     @property
     def frame_dtype(self):
         '''Get the data type of frames (e.g., uint8, uint16)'''
-        bit_depth = self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_PIXELTYPE)
-        if bit_depth == 2.:
-            return "uint16"
-        elif bit_depth == 1.:
-            return "uint8"
-        elif bit_depth == 3.: #12bit
-            self.frame_dtype = "uint8"
-            return "uint8"
-
-    @frame_dtype.setter
-    def frame_dtype(self, dtype):
-        if dtype == "uint8":
-            self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_PIXELTYPE, 1.)
-        elif dtype == "uint16":
-            self.hdcam.dcamprop_setvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_PIXELTYPE, 2.)
+        bit_depth = self.hdcam.dcamprop_getvalue(dcamprop.DCAM_IDPROP.IMAGE_PIXELTYPE)
+        if bit_depth == dcamprop.DCAMPROP.IMAGE_PIXELTYPE__MONO16:
+            return 'uint16'
         else:
-            print("dtype not supported idiont")
+            return 'uint8'
 
     @property
     def frame_shape(self):
         '''Get the shape of frames (height, width)'''
-        return[int(self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_HEIGHT)),
-               int(self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_WIDTH))]
-
+        height = int(self.hdcam.dcamprop_getvalue(dcamprop.DCAM_IDPROP.IMAGE_HEIGHT))
+        width = int(self.hdcam.dcamprop_getvalue(dcamprop.DCAM_IDPROP.IMAGE_WIDTH))
+        return (height, width)
 
     @property
     def sensor_shape(self):
         '''Get the full sensor resolution as (height, width)'''
+        height = int(self.hdcam.dcamprop_getvalue(dcamprop.DCAM_IDPROP.IMAGE_HEIGHT))
+        width = int(self.hdcam.dcamprop_getvalue(dcamprop.DCAM_IDPROP.IMAGE_WIDTH))
+        return (height, width)
 
-        return self._sensor_shape
-
-    def close(self):
-        '''Clean up and close camera connection'''
-        self.hdcam.dcamdev_close()
-        dcamapi_uninit()
-        
     def __del__(self):
         '''Clean up and close camera connection'''
-        self.close()
+        self.hdcam.dcamdev_close()
+        dcamapi.uninit()
+"""
+from pyDCAM import dcamapi_init, HDCAM, DCAMIDPROP
+class HanumatsuCamera_pyDCAM_old(CameraBase):
+    '''Hamamatsu DCAM camera using pydcam'''
 
+    def __init__(self, conf=None):
+        '''Initialize the camera'''
+        device_count = dcamapi_init()[0] #for checking how many are connected, troubleshoot cam connection
+        self.hdcam = HDCAM(device_count)
+        self.sensor_shape =
+    
+    @property
+    def roi(self):
+        '''Get ROI as a dictionary'''
+        return self._roi
+        
+    def set_roi(self, y_size=None, x_size=None, y_offset=None, x_offset=None, y_bin=1, x_bin=1):
+        '''Set the Region of Interest (ROI)
+        
+        Args:
+            y_size: Height of ROI
+            x_size: Width of ROI
+            y_offset: Y offset of ROI
+            x_offset: X offset of ROI
+            y_bin: Vertical binning factor
+            x_bin: Horizontal binning factor
+        '''
+        if y_size is None:
+            y_size = self.sensor_shape[0]
+        if x_size is None:
+            x_size = self.sensor_shape[1]
+        if y_offset is None:
+            y_offset = (self.sensor_shape[0] - y_size) // 2
+        if x_offset is None:
+            x_offset = (self.sensor_shape[1] - x_size) // 2
+        #enable subarray mode
+        if [y_size, x_size] != self.sensor_shape:
+            self.hdcam.subarray_mode = True # Enable subarray mode
+            self.hdcam.subarray_size = (y_size, x_size)
+            self.hdcam.subarray_pos = (y_offset,x_offset)
+        self._roi = dict(y_size=y_size, 
+                         x_size=x_size, 
+                         y_offset=y_offset, 
+                         x_offset=x_offset, 
+                         y_bin=y_bin, 
+                         x_bin=x_bin)
 
+    def set_trigger(self, external=True, each_frame=True):
+        '''Set trigger mode
+        
+        Args:
+            external: True for external trigger, False for internal
+            each_frame: True to trigger each frame, False for trigger on first frame
+        '''
+        ...
+
+    @property
+    def exposure_time(self):
+        '''Get the exposure time (in seconds)'''
+        ...
+    
+    @exposure_time.setter
+    def exposure_time(self, t):
+        '''Set the exposure time (in seconds)
+        
+        Args:
+            t: Exposure time in seconds
+        '''
+        ...
+
+    def arm(self, stream_to_disk_path=None, fifo=True):
+        '''Start acquisition (live mode)
+        
+        Args:
+            stream_to_disk_path: Path to save the streamed data
+            fifo: Whether to use FIFO mode
+        '''
+        ...
+    
+    def disarm(self):
+        '''Stop acquisition'''
+        ...
+
+    def poll_frame(self, copy=False):
+        '''Retrieve a frame from the camera
+        
+        Args:
+            copy: True to return a copy, False to return a reference
+        
+        Returns:
+            Tuple (image_data, timestamp, frame_count)
+        '''
+        ...
+
+    @property
+    def frame_dtype(self):
+        '''Get the data type of frames (e.g., uint8, uint16)'''
+        ...
+    
+    @property
+    def frame_shape(self):
+        '''Get the shape of frames (height, width)'''
+        return [self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_HEIGHT),
+                self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_WIDTH)]
+    @property
+    def sensor_shape(self):
+        '''Get the full sensor resolution as (height, width)'''
+        return [self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_HEIGHT),
+                self.hdcam.dcamprop_getvalue(DCAMIDPROP.DCAM_IDPROP_IMAGE_WIDTH)]
+    def __del__(self):
+        '''Clean up and close camera connection'''
+        ...
 
 
 class FrameQueue():

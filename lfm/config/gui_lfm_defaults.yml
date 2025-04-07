@@ -3,11 +3,12 @@ acquisition:
   name_suffix: ''
   compress: True
   stimulus_file: ''
-  ramp_s: 0
-  recording_s: 1
+  ramp_seconds: 0
+  recording_seconds: 1
   led_percent: 10
 camera:
   recording_fps: 300
+  preview_fps: 10
   gain: 1
   cam_trig_width_ms: 0.1
   ROI: #only in steps of 4
@@ -17,7 +18,14 @@ camera:
     x_decenter: 0
     y_bin: 1
     x_bin: 1 #=y_bin
-  preview_fps: 10
+psf:
+  base_directory: 'D:\'
+  name_suffix: ''
+  z_layers: 40
+  z_distance_mm: 0.005
+  n_frames: 100
+  stage_type: 'standa' #"sutter"
+  overshoot: 0.001
 daq:
   rate: 50000
   device: 'Dev1'

@@ -43,7 +43,6 @@ def get_full_waveforms(conf, preview= False):
     '''
     fps = conf['camera']['preview_fps'] if preview else conf['camera']['recording_fps']
     frame_time = 1000/fps
-    assert frame_time >= conf['camera']['exposure_ms'], f"fps of {fps} means {frame_time} ms per frame, which is shorter than the {conf['camera']['exposure_ms']} ms exposure time"
 
     trigger_single = np.zeros(conf['daq']['rate'])
     for frame_start in range(0, conf['daq']['rate'], conf['daq']['rate']//fps):
@@ -109,7 +108,7 @@ def get_preview_callback(im_shape, edge_sz=10, refresh_every=30, window_title='P
     return callback, imv
 
 
-from cams import HanumatsuCamera as Camera
+from cams import DCamera as Camera
 from daq import unifiedDAO
 from write import ParallelCompressedWriter, VanillaWriter
 
@@ -145,17 +144,45 @@ class LFM:
         record the point spread function
         stage control and stuff
         """
-        ...
+        logger.info("Initializing Stage")
+        from stage import StandaStage, get_connected_axes
+        from stage_old import sutterMP285
+        if conf["psf"]["stage_type"] == "standa":
+            self.stage = StandaStage(uris = get_connected_axes(),
+                                     calibration=conf["psf"]["calibration"],
+                                     overshoot=conf["psf"]["overshoot"])
+        elif conf["psf"]["stage_type"] == "sutter":
+            self.stage = sutterMP285("COM4")
+        else:
+            logger.warning("Stage type not supported (must be either 'standa' or 'sutter')")
+
+        _, _, ao_single, do_single, ft = get_full_waveforms(conf,measure_psf=True)
+
+        psf = np.zeros(shape=(conf["psf"]["z_layers"], self.cam.frame_shape[0], self.cam.frame_shape[1]))
+        z_positions = np.zeros(shape=(conf["psf"]["z_layers"]))
+
+        original_pos = self.stage.get_position()
+        self.cam.set_trigger(external=False)
+
+        with self.dao.queue_data(ao_single, do_single, finite=False, chunked=False):
+            for z in range(conf["psf"]["z_layers"]):
+                psf[z,:,:] = self.cam.acquire_stack(conf["psf"]["n_frames"])[0].mean(axis=0)
+                z_positions[z] = self.stage.get_position()[2]
+                self.stage.move((0,0,-conf["psf"]["z_distance_mm"]))
+
+        self.stage.move_to(original_pos)
+        self.stage.close()
+
 
     def start_preview(self, conf):
         """Start a preview of camera frames."""
-        ao_single, do_single, ft = get_full_waveforms(conf, preview=True)
+        _ , _ , ao_single, do_single, ft = get_full_waveforms(conf, preview=True)
         
-        self.cam.exposure_time = conf['camera']['preview_fps'] / 1000
+        self.cam.exposure_time = 1/conf['camera']['preview_fps']
         self.cam.set_trigger(external=True,each_frame=True)
 
         with self.dao.queue_data(ao_single, do_single, finite=False, chunked=False):
-            self.cam.preview(fifo=False) #TODO implement
+            self.cam.preview(fifo=False)
 
         self.point()
         logger.info(f"Preview stopped")
@@ -193,7 +220,7 @@ class LFM:
         n_frames = conf['acquisition']['recording_s']*conf["camera"]["recording_fps"]
         n_ramp_frames = conf['acquisition']['ramp_s']*conf["camera"]["recording_fps"]
         stack_shape = (n_frames, *self.cam.frame_shape)
-        stack_dtype = 'uint8'
+        stack_dtype = self.cam.frame_dtype
         if conf['acquisition']['compress']:
             writer = ParallelCompressedWriter(fn=fn,
                                               name="data",
@@ -238,7 +265,7 @@ class LFM:
             preview_callback(im, ii, timestamp, frame_number)
 
         # start camera acquisition
-        self.cam.exposure_time = conf['camera']['exposure_ms'] * 1000
+        self.cam.exposure_time = 1/conf['camera']['recording_fps']
         self.cam.set_trigger(external=True, each_frame=False)
         self.cam.arm()
 

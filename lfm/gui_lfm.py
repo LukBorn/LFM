@@ -259,6 +259,10 @@ if __name__ == "__main__":
             lfm.cam.start_beam_array(di.to_dict())
         elif name == "point":
             lfm.point()
+        elif name == "grab_psf":
+            lfm.grab_psf(di.to_dict())
+        elif name == "preview_psf":
+            lfm.preview_psf(di.to_dict())
         else:
             print(f"did not understand {name}")
         setOptsRecursive(di.p, enabled=True)
@@ -282,6 +286,14 @@ if __name__ == "__main__":
             point=lambda d: button_callback("point"),
         )
     )
+    params_dict["psf"].update(
+        dict(
+            grab_psf = lambda  d: button_callback("grab_psf"),
+            preview_psf = lambda d: button_callback("preview_psf"),
+        )
+    )
+
+
 
     # Initialize OPM object
     logger.info("Initializing LFM object")
@@ -295,7 +307,7 @@ if __name__ == "__main__":
 
     # Initialize GUI
     logger.info("Initializing GUI")
-    di = DictInspector(params_dict, "OPM")
+    di = DictInspector(params_dict, "LFM")
     di.move(0, 0)
     di.p.child("acquisition").child("stimulus_file").sigValueChanged.connect(
         lambda p, fn: lfm.load_stimdata(p, fn, di.to_dict())

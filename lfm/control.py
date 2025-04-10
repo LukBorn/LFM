@@ -1,6 +1,6 @@
-from .cams import DCamera as Camera
-from .daq import unifiedDAO
-from .write import ParallelCompressedWriter, VanillaWriter
+from cams import PVCamera as Camera
+from daq import unifiedDAO
+from write import ParallelCompressedWriter, VanillaWriter
 
 import numpy as np
 import os

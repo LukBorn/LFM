@@ -3,14 +3,14 @@ acquisition:
   name_suffix: ''
   compress: True
   stimulus_file: ''
-  ramp_seconds: 0
+  ramp_seconds: 5
   recording_seconds: 10
-  led_percent: 50
+  led_percent: 10
 camera:
-  recording_fps: 10
+  recording_fps: 80
   preview_fps: 10
   gain: 1
-  cam_trig_width_ms: 0.05
+  cam_trig_width_ms: 0.02
   ROI: #only in steps of 4
     y_size: 2048
     x_size: 2048
@@ -26,7 +26,7 @@ psf:
   n_frames: 100
 stage:
   type: 'standa' #"sutter"
-  calibration: [.0025, .0025, .005]
+  calibration:
   overshoot: 0.001
   preview_move_mm: 0.01
 daq:

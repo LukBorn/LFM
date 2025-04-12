@@ -320,6 +320,7 @@ if __name__ == "__main__":
     logger.info("Startup complete")
     app.exec()
     logger.info("GUI closed")
+    lfm.point()
     del lfm
 
 

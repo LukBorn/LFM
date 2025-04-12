@@ -29,7 +29,7 @@ class SimpleArrayProxy:
             slices = (slices,)
         return self._custom_getitem(slices)
 
-def get_full_waveforms(conf, preview=False,ft = None):
+def get_full_waveforms(conf,preview = False, ft = 0.01):
     ''' Generate full waveforms for the entire recording, including ramping. Note this uses SimpleArrayProxy to avoid storing the entire array in memory.
 
     Args:
@@ -42,7 +42,10 @@ def get_full_waveforms(conf, preview=False,ft = None):
         float: Updated frame time in ms.
     '''
     fps = conf['camera']['preview_fps'] if preview else conf['camera']['recording_fps']
-    frame_time = ft if ft is not None else 1/fps
+    frame_time = 1/fps
+    if ft is not None:
+        frame_time = ft
+        fps = int(1/ft)
 
     trigger_single = np.zeros((1,conf['daq']['rate']))
     for frame_start in range(0, conf['daq']['rate'], conf['daq']['rate']//fps):
@@ -88,22 +91,28 @@ def get_preview_callback(im_shape, edge_sz=10, refresh_every=5, window_title='Pr
         function: Interrupt function.
     """
 
-    im_buffer = np.zeros((im_shape[0]+edge_sz, im_shape[1]+edge_sz), dtype=np.uint8)  # Only store the most recent frame
+    # Create a main window with layout
+    main_window = pg.Qt.QtWidgets.QWidget()
+    layout = pg.Qt.QtWidgets.QVBoxLayout()
+    main_window.setLayout(layout)
+    main_window.setWindowTitle("PSF Preview with Z Position")
+    main_window.resize(900, 950)  # Adjust dimensions for both image and label
+    main_window.show()
 
+    # Create the ImageView and add it to the layout
     imv = pg.ImageView()
-    imv.ui.menuBtn.hide()
+    imv.ui.menuBtn.hide()  # Hide unnecessary buttons
     imv.ui.roiBtn.hide()
-    imv.resize(im_shape[1] // 2, im_shape[0] // 2)
-    imv.move(355, 0)
-    imv.setWindowTitle(window_title)
-    imv.show()
+    layout.addWidget(imv)  # Add ImageView to the layout
+
+    # Add a QLabel for displaying the relative Z position
+    z_label = pg.Qt.QtWidgets.QLabel()
+    layout.addWidget(z_label)
 
     def callback(im_np, i_frame, timestamp, frame_count):
         """Updates the displayed image every 'refresh_every' frames."""
-        nonlocal im_buffer
-        im_buffer[:] = im_np # Copy the new frame into buffer
         if i_frame % refresh_every == 0:
-            imv.setImage(im_buffer, levels=(0, 255), autoHistogramRange=False)
+            imv.setImage(im_np[::2,::2], levels=(0, 255), autoHistogramRange=False)
             pg.Qt.QtWidgets.QApplication.processEvents()
 
     return callback, imv
@@ -127,8 +136,7 @@ class LFM:
         self.shutter_close = self.dao.shutter_close
         logger.info('Initializing Camera')
         self.cam = Camera()
-
-
+        self.point()
         self.interrupt_flag = False
 
     def point(self):
@@ -139,7 +147,10 @@ class LFM:
         self.dao.queue_data(np.zeros((len(chans), 2)), finite=True, chunked=False)
         self.dao.task_ao.start()
         self.dao.task_ao.wait_until_done()
-        self.dao.close()
+        try:
+            self.dao.close()  # Attempt to clean up, but handle warnings gracefully
+        except Exception as e:
+            logger.warning(f"Attempted to close an already-closed task: {e}")
         logger.info('point')
     
     def init_stage(self, conf, verbose):
@@ -161,46 +172,109 @@ class LFM:
         record the point spread function
         stage control and stuff
         """
-        self.init_stage(conf,verbose=False)
-        _, _, ao_single, do_single, ft = get_full_waveforms(conf,)
+        self.cam.frame_dtype = conf["camera"]["dtype"]
+        self.cam.exposure_time = conf["psf"]["exposure_ms"] / 1000
 
+        # collect background frame
+        logger.info('Acquiring background frame...')
+        self.cam.set_trigger(external=False)  # internal trigger because were aquiring stack not streaming data?
+        bg_im = self.cam.acquire_stack(int(5/self.cam.exposure_time))[0].mean(0, dtype='float32') #five seconds
+
+        self.init_stage(conf,verbose=False)
+        original_pos = self.stage.get_position(verbose=True)
+
+        _, _, ao_single, do_single, ft = get_full_waveforms(conf,ft=conf["psf"]["exposure_ms"]/1000)
         psf = np.zeros(shape=(conf["psf"]["z_layers"], self.cam.frame_shape[0], self.cam.frame_shape[1]))
+
         z_positions = np.zeros(shape=(conf["psf"]["z_layers"]))
 
-        original_pos = self.stage.get_position()
-        self.cam.set_trigger(external=False)
+        # Create a main window with layout
+        main_window = pg.Qt.QtWidgets.QWidget()
+        layout = pg.Qt.QtWidgets.QVBoxLayout()
+        main_window.setLayout(layout)
+        main_window.setWindowTitle("PSF Preview with Z Position")
+        main_window.resize(900, 950)  # Adjust dimensions for both image and label
+        main_window.show()
+
+        # Create the ImageView and add it to the layout
+        imv = pg.ImageView()
+        imv.ui.menuBtn.hide()  # Hide unnecessary buttons
+        imv.ui.roiBtn.hide()
+        layout.addWidget(imv)  # Add ImageView to the layout
+        imv.setImage(bg_im, levels=(0, 255), autoHistogramRange=False)
+        pg.Qt.QtWidgets.QApplication.processEvents()
+
+        # Add a QLabel for displaying the relative Z position
+        z_label = pg.Qt.QtWidgets.QLabel()
+        layout.addWidget(z_label)  # Add QLabel below the image
+
+        self.cam.set_trigger(external=True, each_frame=False)
+        logger.info(f"Exposure time{self.cam.exposure_time*1000}ms")
 
         with self.dao.queue_data(ao_single, do_single, finite=False, chunked=False):
-            for z in range(conf["psf"]["z_layers"]):
-                psf[z,:,:] = self.cam.acquire_stack(conf["psf"]["n_frames"])[0].mean(axis=0)
-                z_positions[z] = self.stage.get_position()[2]
-                self.stage.move((0,0,-conf["psf"]["z_distance_mm"]))
+            for z in range(conf["psf"]["z_layers"]): #tdqm(range(conf["psf"]["z_layers"]),f"Acquiring PSF of {conf["psf"]["z_layers"]}layers with distance {conf["psf"]["z_distance_mm"]}mm"):
+                z_pos = self.stage.get_position(verbose=False)[2]
+                z_positions[z] = z_pos
+                z_label.setText(f"Relative Z Position: {original_pos[2] - z_pos:.3f} mm")
+                pg.Qt.QtWidgets.QApplication.processEvents()
+                avg_frame = np.zeros(shape=(conf["psf"]["n_frames"],self.cam.frame_shape[0], self.cam.frame_shape[1]))
+                for n in tqdm(range(conf["psf"]["n_frames"]), desc=f"Acquiring layer {z+1} of {conf["psf"]["z_layers"]} at zpos {z_pos}",position=0, leave=True):
+                    frame_data = self.cam.acquire_stack(1, verbose=False)[0]
+                    imv.setImage(frame_data.T, levels=(0, 255), autoHistogramRange=False)  # Update data
+                    pg.Qt.QtWidgets.QApplication.processEvents()  # Update the GUI
+                    avg_frame[n,:,:] = frame_data
+                    # Detect if the preview window has been closed
+                if not imv.isVisible():
+                    logger.warning(f"Acquisition interrupted after layer {z}.")
+                    self.interrupt_flag = True
+                    break
 
-        #todo save somehwo
+                psf[z, :, :] = avg_frame.mean(axis=0)
+                self.stage.move((0, 0, -conf["psf"]["z_distance_mm"]))
 
-        self.stage.move_to(original_pos)
+        self.stage.move_to(original_pos, verbose= True)
         self.stage.close()
+        self.point()
 
+        if conf["psf"]["name_suffix"].strip() != "" or self.interrupt_flag:
+            # create directory, save metadata and open HDF5 file
+            dirname = arrow.now().format("YYYYMMDD_HHmm") + "_PSF_" + conf['psf']['name_suffix']
+            p_target = os.path.join(conf['psf']['base_directory'], dirname)
+
+            if not os.path.exists(p_target):
+                os.mkdir(p_target)
+            else:
+                logger.error('Directory exists! aborting')
+                return
+            fn = os.path.join(p_target, "psf.h5")
+            logger.info(f"Saving PSF to {fn}")
+            with h5py.File(fn, 'w') as fh5:
+                fh5.create_dataset("bg", data=bg_im)
+                fh5.create_dataset("psf", data=psf)
+                fh5.create_dataset("z_positions", data=z_positions)
+            self.interrupt_flag = False
+        logger.info(f"PSF acquisition complete.")
 
     def preview_psf(self, conf):
-        #gave up on this for now
-        self.init_stage(conf,verbose=True)
-        _, _, ao_single, do_single, ft = get_full_waveforms(conf, preview=True)
+        #todo add stage controls
+        self.cam.frame_dtype = conf["camera"]["dtype"]
+        self.cam.exposure_time = conf["psf"]["exposure_ms"] / 1000
+        _, _, ao_single, do_single, ft = get_full_waveforms(conf,ft=conf["psf"]["exposure_ms"]/1000)
+        self.cam.set_trigger(external=False, each_frame=True)
+        filter_fcn = lambda im: ((im - im.min()) * (255 / (im.max() - im.min()))).astype(im.dtype)
 
-        self.cam.exposure_time = 1 / conf['camera']['preview_fps']
-        self.cam.set_trigger(external=True, each_frame=True)
+        with self.dao.queue_data(ao_single, do_single, finite=True, chunked=False):
+            self.cam.preview(filter_fcn=filter_fcn)
 
-        with self.dao.queue_data(ao_single, do_single, finite=False, chunked=False):
-            self.cam.preview_with_controls(self.stage,
-                                           step = conf["stage"]["preview_move_mm"],
-                                           fifo =False,
-                                           range = conf["psf"]["z_layers"]*conf["psf"]["z_distance_mm"])
+        self.point()
+        logger.info(f"Preview stopped")
 
-        self.stage.close()
 
     def start_preview(self, conf):
+        #todo doesnt work :/
         """Start a preview of camera frames."""
-        preview_callback, imv = get_preview_callback(self.cam.frame_shape, refresh_every=5)
+        self.cam.frame_dtype = conf["camera"]["dtype"]
+        preview_callback, imv = get_preview_callback(self.cam.frame_shape, refresh_every=2)
         pg.Qt.QtWidgets.QApplication.processEvents(pg.Qt.QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 100)
         interrupt = lambda: not imv.isVisible() or self.interrupt_flag
 
@@ -218,9 +292,11 @@ class LFM:
         logger.info(f"Preview stopped")
 
 
+
     def acquire_timelapse(self, conf):
         """Acquire a timelapse.
         """
+        self.cam.frame_dtype = conf["camera"]["dtype"]
 
         # create directory, save metadata and open HDF5 file
         dirname = arrow.now().format("YYYYMMDD_HHmm_") + conf['acquisition']['name_suffix']
@@ -241,6 +317,7 @@ class LFM:
 
         # collect background frame
         logger.info('Acquiring background frame...')
+        self.cam.frame_dtype = conf["camera"]["dtype"]
         self.cam.set_trigger(external=False, each_frame=True) #internal trigger because were aquiring stack not streaming data?
         bg_im = self.cam.acquire_stack(N_BACKGROUND_FRAMES)[0].mean(0, dtype='float32')
         with h5py.File(fn, 'w') as fh5:

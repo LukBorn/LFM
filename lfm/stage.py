@@ -4,9 +4,51 @@ import time
 import libximc.highlevel as ximc
 import numpy as np
 
-
 from opm_acquire.stage import sutterMP285
-#TODO implement SutterStage() with the same functions as StandaStage()
+class SutterStage:
+    def __init__(self, verbose=False, overshoot=0.001,com = "COM4"):
+        self.stage = sutterMP285(com)
+        self.overshoot = overshoot
+        self.verbose = verbose
+
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        del self.stage
+
+    def get_position(self, verbose=None):
+        if verbose is None:
+            verbose = self.verbose
+        pos = self.stage.getPosition() * 1000
+        if verbose:
+            print(f'Current Position: {[f"{p} mm" for p in pos]} (x,y,z)')
+        return pos
+
+    def set_origin(self):
+        if self.verbose:
+            print(f'Setting origin...')
+        self.stage.setOrigin()
+
+    def move(self, relative_position, verbose=None):
+        if verbose is None:
+            verbose = self.verbose
+        pos = self.get_position(verbose=verbose)
+        new_position = [pos[0] + relative_position[0], pos[1] + relative_position[1], pos[2] + relative_position[2]]
+        self.move_to(new_position,verbose=verbose)
+        self.get_position(verbose=verbose)
+
+    def move_to(self, new_position, verbose=None):
+        if verbose is None:
+            verbose = self.verbose
+        position = [new_position[0] / 1000, new_position[1] / 1000, new_position[2] / 1000]
+        position_over = [position[0] + self.overshoot * np.sign(position[0]),
+                         position[1] + self.overshoot * np.sign(position[1]),
+                         position[2] + self.overshoot * np.sign(position[2]),]
+        self.stage.gotoPosition(position_over)
+        self.stage.gotoPosition(position)
+        self.get_position(verbose=verbose)
+
 
 def get_virtual_axes(n):
     uris = {}
@@ -30,7 +72,7 @@ def get_connected_axes(virtual=0):
     )
 
     if len(devices) == 0:
-        print("No devices were found. A virtual device will be used.")
+        Warning("No devices were found. A virtual device will be used.")
         virtual_device_filename = "virtual_motor_controller_1.bin"
         virtual_device_file_path = os.path.join(
             pathlib.Path().cwd(),
@@ -77,10 +119,12 @@ class StandaStage:
         for axis in self.axes:
             axis.close_device()
 
-    def get_position(self):
+    def get_position(self, verbose=None):
+        if verbose is None:
+            verbose = self.verbose
         pos = [axis.get_position_calb().Position for axis in self.axes]
-        if self.verbose:
-            print(f'Current Position: {[f"{p} mm" for p in pos]} (x,y,z)')
+        if verbose:
+            print(f'Current Position:\n', f"X: {pos[0]:.3f}\n", f"Y: {pos[1]:.3f}\n",f"Z: {pos[2]:.3f}\n")
         return pos
 
     def set_origin(self):
@@ -90,7 +134,9 @@ class StandaStage:
         for axis in self.axes:
             axis.command_zero()
 
-    def move(self, relative_position):
+    def move(self, relative_position, verbose=None):
+        if verbose is None:
+            verbose = self.verbose
         assert len(relative_position) == len(self.axes), "input must have same shape as .axes"
         for i,axis in enumerate(self.axes):
             if relative_position[i] != 0:
@@ -99,22 +145,25 @@ class StandaStage:
                 axis.command_movr_calb(relative_position[i]+overshoot)
                 axis.command_wait_for_stop(10)
                 axis.command_movr_calb(-overshoot)
-            if self.verbose:
-                print(f"Finished moving axis{i} after {((time.time() - start_time) * 1000):.2f} ms")
-            self.get_position()
+                if verbose:
+                    print(f"Finished moving axis{i} after {((time.time() - start_time) * 1000):.2f} ms")
+            self.get_position(verbose=verbose)
 
-    def move_to(self, new_position):
+    def move_to(self, new_position,verbose=None):
+        if verbose is None:
+            verbose = self.verbose
+        old_position = self.get_position(verbose=False)
         assert len(new_position) == len(self.axes), "input must have same shape as .axes"
         for i,axis in enumerate(self.axes):
-            if new_position[i] != 0:
-                overshoot = self.overshoot * np.sign(new_position[i])
+            if new_position[i] != old_position[i]:
+                overshoot = self.overshoot * np.sign(new_position[i]-old_position[i])
                 start_time = time.time()
                 axis.command_move_calb(new_position[i])
                 axis.command_wait_for_stop(10)
                 axis.command_movr_calb(-overshoot)
-            if self.verbose:
-                print(f"Finished moving axis {i} after {((time.time() - start_time) * 1000):.2f} ms")
-            self.get_position()
+                if verbose:
+                    print(f"Finished moving axis {i} after {((time.time() - start_time) * 1000):.2f} ms")
+            self.get_position(verbose=verbose)
 
     def get_velocity(self):
         print("Warning: doesnt work for some reason")

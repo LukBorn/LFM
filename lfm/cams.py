@@ -110,7 +110,7 @@ class CameraBase(ABC):
         '''Get number of bytes per frame'''
         return np.prod(self.frame_shape) * np.dtype(self.frame_dtype).itemsize
 
-    def stream(self, num_frames, callback=None, interrupt=None, stream_to_disk_path=None, fifo=True, already_armed=False):
+    def stream(self, num_frames, callback=None, interrupt=None, stream_to_disk_path=None, fifo=True, already_armed=False, verbose=True):
         '''Loop through frames.
 
         Args:
@@ -125,7 +125,8 @@ class CameraBase(ABC):
             self.arm(stream_to_disk_path=stream_to_disk_path, fifo=fifo)
 
         last_frame = -1
-        for i_frame in tqdm(range(num_frames)):
+        looper = tqdm(range(num_frames)) if verbose else range(num_frames)
+        for i_frame in looper:
 
             if interrupt is not None and interrupt():
                 break
@@ -145,7 +146,7 @@ class CameraBase(ABC):
             last_frame = frame_count
         self.disarm()
 
-    def acquire_stack(self, num_frames):
+    def acquire_stack(self, num_frames, verbose=True):
         '''Acquire stack of frames
 
         Args:
@@ -163,7 +164,7 @@ class CameraBase(ABC):
             timestamps[i_frame] = timestamp
             frame_counts[i_frame] = frame_count
 
-        self.stream(num_frames, callback=callback)
+        self.stream(num_frames, callback=callback,verbose=verbose)
         timestamps[-1]=time.time()
         return im_stack, timestamps, frame_counts
 
@@ -723,7 +724,7 @@ class DCamera(CameraBase):
     def poll_frame(self, copy=False):
         '''Retrieve a frame from the camera'''
         hwait = self.hdcam.dcamwait_open()
-        hwait.dcamwait_start(timeout = 1000)
+        hwait.dcamwait_start(timeout = 5000)
         frame_index, frame_count = self.hdcam.dcamcap_transferinfo()
 
         if frame_index < 0:

@@ -7,10 +7,11 @@ acquisition:
   recording_seconds: 10
   led_percent: 50
 camera:
-  recording_fps: 10
+  recording_fps: 80
   preview_fps: 10
   gain: 1
   cam_trig_width_ms: 0.05
+  dtype: "uint8" #"uint16 and "uint8" supported
   ROI: #only in steps of 4
     y_size: 2048
     x_size: 2048
@@ -21,9 +22,10 @@ camera:
 psf:
   base_directory: 'D:\'
   name_suffix: ''
-  z_layers: 40
-  z_distance_mm: 0.005
-  n_frames: 100
+  z_layers: 120
+  z_distance_mm: 0.025
+  n_frames: 10
+  exposure_ms: 500
 stage:
   type: 'standa' #"sutter"
   calibration: [.0025, .0025, .005]

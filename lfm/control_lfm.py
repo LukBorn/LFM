@@ -212,13 +212,14 @@ class LFM:
         logger.info(f"Exposure time{self.cam.exposure_time*1000}ms")
 
         with self.dao.queue_data(ao_single, do_single, finite=False, chunked=False):
+            outer = tqdm(range(conf["psf"]["z_layers"]),f"Acquiring PSF of {conf["psf"]["z_layers"]} layers with distance {conf["psf"]["z_distance_mm"]}mm",position=0, leave=True)
             for z in range(conf["psf"]["z_layers"]): #tdqm(range(conf["psf"]["z_layers"]),f"Acquiring PSF of {conf["psf"]["z_layers"]}layers with distance {conf["psf"]["z_distance_mm"]}mm"):
                 z_pos = self.stage.get_position(verbose=False)[2]
                 z_positions[z] = z_pos
                 z_label.setText(f"Relative Z Position: {original_pos[2] - z_pos:.3f} mm")
                 pg.Qt.QtWidgets.QApplication.processEvents()
                 avg_frame = np.zeros(shape=(conf["psf"]["n_frames"],self.cam.frame_shape[0], self.cam.frame_shape[1]))
-                for n in tqdm(range(conf["psf"]["n_frames"]), desc=f"Acquiring layer {z+1} of {conf["psf"]["z_layers"]} at zpos {z_pos}",position=0, leave=True):
+                for n in tqdm(range(conf["psf"]["n_frames"]), desc=f"Acquiring layer {z+1} of {conf["psf"]["z_layers"]} at zpos {z_pos:.5f}",position=0, leave=True):
                     frame_data = self.cam.acquire_stack(1, verbose=False)[0]
                     imv.setImage(frame_data.T, levels=(0, 255), autoHistogramRange=False)  # Update data
                     pg.Qt.QtWidgets.QApplication.processEvents()  # Update the GUI

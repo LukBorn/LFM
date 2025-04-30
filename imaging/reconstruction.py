@@ -1,4 +1,5 @@
 import numpy as np
+import cupy as cp
 from tqdm.auto import tqdm
 from numpy.fft import fft2, ifft2, fftshift, ifftshift
 import time
@@ -12,6 +13,7 @@ def reconstruct_vol_from_img(img,
                              roi_size,
                              verbose,
                              ):
+    from numpy.fft import fft2, ifft2, fftshift, ifftshift
     size_x, size_y = psf.shape[0]+2*xy_pad, psf.shape[1]+2*xy_pad
     size_z = psf.shape[2]
     print("Initalizing Memory") if verbose else None

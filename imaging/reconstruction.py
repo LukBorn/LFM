@@ -1,63 +1,244 @@
 import numpy as np
 import cupy as cp
+import scipy.signal
+from pyqtgraph.examples.logAxis import plotdata
 from tqdm.auto import tqdm
-from numpy.fft import fft2, ifft2, fftshift, ifftshift
+from numpy.fft import fft2 as np_fft2, ifft2 as np_ifft2, fftshift as np_fftshift, ifftshift as np_ifftshift
+from cupy.fft import fft2 as cp_fft2, ifft2 as cp_ifft2, fftshift as cp_fftshift, ifftshift as cp_ifftshift
+
 import time
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
+from scipy.signal import fftconvolve
+
+
 
 def reconstruct_vol_from_img(img,
-                             psf_1,
-                             psf_2,
-                             n_iter,
-                             ratio,
-                             xy_pad,
-                             roi_size,
-                             verbose,
+                             psf1,
+                             psf2,
+                             n_iter=30,
+                             ratio=0.5,
+                             xy_pad=201,
+                             roi_size=300,
+                             verbose=True,
+                             gpu=False
                              ):
-    from numpy.fft import fft2, ifft2, fftshift, ifftshift
-    size_x, size_y = psf_1.shape[0]+2*xy_pad, psf_1.shape[1]+2*xy_pad
-    size_z = psf_1.shape[2]
-    print("Initalizing Memory") if verbose else None
+    if gpu:
+        xp = cp
+        fft2, ifft2, fftshift, ifftshift = cp_fft2, cp_ifft2, cp_fftshift, cp_ifftshift
+    else:
+        xp = np
+        fft2, ifft2, fftshift, ifftshift = np_fft2, np_ifft2, np_fftshift, np_ifftshift
 
-    OTF_A = np.zeros((size_x, size_y, size_z), dtype=np.complex64)
-    OTF_B = np.zeros((size_x, size_y, size_z), dtype=np.complex64)
+    size_x = psf1.shape[0] + 2 * xy_pad
+    size_y = psf1.shape[1] + 2 * xy_pad
+    size_z = psf1.shape[2]
+
+    if verbose:
+        print("Initializing memory")
+
+    OTF = xp.zeros((size_x, size_y, size_z), dtype=xp.complex64)
+
 
     for i in range(size_z):
-        OTF_A[:,:,i] = fft2(ifftshift(np.pad(psf_1[:,:,i], ((xy_pad,xy_pad), (xy_pad,xy_pad)), mode='constant', constant_values=0)))
-        OTF_B[:,:,i] = fft2(ifftshift(np.pad(psf_2[:,:,i], ((xy_pad,xy_pad), (xy_pad,xy_pad)), mode='constant', constant_values=0)))
+        OTF[:, :, i] = fft2(ifftshift(xp.pad(psf1[:, :, i], ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')))
 
-    size_x_add = round((size_x/ratio-size_x)/2)
-    size_y_add = round((size_y/ratio-size_y)/2)
-    size_x_sub = round(size_x*(1-ratio)/2)+size_x
-    size_y_sub = round(size_y*(1-ratio)/2)+size_y
+    size_add = round((size_x / ratio - size_x) / 2)
+    size_sub = round(size_x * (1 - ratio) / 2) + size_add
 
-    temp_1 = np.zeros((size_x+2*size_x_add, size_y+2*size_y_add), dtype=np.complex64)
-    temp_2 = np.zeros((size_x+2*size_x_add, size_y+2*size_y_add), dtype=np.complex64)
-    temp_3 = np.zeros((size_x, size_y), dtype=np.float32)
+    temp_1 = xp.zeros((size_x + 2 * size_add, size_y + 2 * size_add), dtype=xp.complex64)
+    temp_2 = xp.zeros_like(temp_1, dtype=xp.float32)
+    temp_3 = xp.zeros((size_x, size_y), dtype=xp.float32)
 
-    img_padded = np.pad(img, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant', constant_values=0)
+    img_padded = xp.pad(img, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')
 
-    temp_obj_recon = np.zeros((size_x, size_y), dtype=np.float32)
-    obj_recon = np.zeros((2*roi_size,2*roi_size,size_z), dtype=np.float32)
-    img_estimate = np.zeros((size_x, size_y), dtype=np.float32)
-    # ratio = np.zeros((size_x, size_y), dtype=np.float32)
-    print("Finished Initalizing Memory") if verbose else None
+    temp_obj = xp.zeros((size_x, size_y), dtype=xp.float32)
+    obj_recon = xp.ones((2 * roi_size, 2 * roi_size, size_z), dtype=xp.float32)
+    img_est = xp.zeros((size_x, size_y), dtype=xp.float32)
+    ratio_img = xp.zeros((size_x, size_y), dtype=xp.float32)
 
-    for i in tqdm(range(n_iter)):
-        img_estimate *= 0
-        for j in range(size_z):
-            temp_obj_recon[size_x/2-roi_size+1:,:] = obj_recon[:,:,j] #todo
-            temp_1[xy_pad:-xy_pad] = fftshift(fft2(temp_obj_recon))
-            temp_2 = np.abs(ifft2(ifftshift(temp_1)))
-            img_estimate += np.maximum(np.real(ifft2(OTF_A[:,:,j])*fft2(temp_obj_recon)),0)
-            img_estimate += np.maximum(np.real(ifft2(OTF_B[:,:,j])*fft2(temp_2[size_x_add:-size_x_add,size_y_add:-size_y_add])),0)
+    for it in tqdm(range(n_iter)):
+        img_est.fill(0)
 
-        temp_4 = img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad]/(img_estimate[xy_pad:-xy_pad, xy_pad:-xy_pad] + np.finfo(np.float32).eps)
-        ratio = np.full_like(temp_4, np.mean(temp_4,dtype=np.float32),dtype=np.float32)
-        ratio *= (img_estimate > (np.max(img_estimate)/200)).astype(np.float32)
-        ratio[xy_pad:-xy_pad, xy_pad:-xy_pad] = img_estimate[xy_pad:-xy_pad, xy_pad:-xy_pad] / (img_estimate[xy_pad:-xy_pad, xy_pad:-xy_pad] + np.finfo(np.float32).eps)
+        for z in range(size_z):
+            temp_obj[size_x // 2 - roi_size: size_x // 2 + roi_size,
+            size_y // 2 - roi_size: size_y // 2 + roi_size] = obj_recon[:, :, z]
+            temp_1[size_add:-size_add, size_add:-size_add] = fftshift(fft2(temp_obj))
+            temp_2 = xp.abs(ifft2(ifftshift(temp_1)))
+            img_est += xp.maximum(xp.real(ifft2(OTF_A[:, :, z] * fft2(temp_obj))), 0)
+            img_est += xp.maximum(xp.real(ifft2(OTF_B[:, :, z] * fft2(temp_2[size_add:-size_add, size_add:-size_add]))),
+                                  0)
+
+        temp_4 = img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] / (
+                    img_est[xy_pad:-xy_pad, xy_pad:-xy_pad] + xp.finfo(xp.float32).eps)
+        ratio_img.fill(xp.mean(temp_4, dtype=xp.float32))
+        ratio_img *= (img_est > (xp.max(img_est) / 200)).astype(xp.float32)
+        ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad] = img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] / (
+                    img_est[xy_pad:-xy_pad, xy_pad:-xy_pad] + xp.finfo(xp.float32).eps)
+
         temp_2.fill(0)
 
-        for j in range(size_z):
-            temp_1[size]
+        for z in range(size_z):
+            temp_1[size_add:-size_add, size_add:-size_add] = fftshift(fft2(ratio_img) * xp.conj(OTF_B[:, :, z]))
+            temp_2[size_sub:-size_sub, size_sub:-size_sub] = xp.abs(
+                ifft2(ifftshift(temp_1[size_sub:-size_sub, size_sub:-size_sub])))
+            temp_obj[size_x // 2 - roi_size: size_x // 2 + roi_size,
+                    size_y // 2 - roi_size: size_y // 2 + roi_size] = obj_recon[:, :, z]
+            temp_3 = temp_obj * (xp.maximum(xp.real(ifft2(fft2(ratio_img) * xp.conj(OTF_A[:, :, z]))), 0) + temp_2[
+                                                                                                            size_add:-size_add,
+                                                                                                            size_add:-size_add]) / 2
+            obj_recon[:, :, z] = temp_3[size_x // 2 - roi_size: size_x // 2 + roi_size,
+                                 size_y // 2 - roi_size: size_y // 2 + roi_size]
+
+
+
+    return obj_recon
+
+def reconstruct_volume_cpu(img,
+                           psf,
+                           obj_0=None,
+                           n_iter=30,
+                           roi_size=600,
+                           verbose=True,
+                           plot=False,
+                           ):
+    """
+    img: LFM image: 2d array
+    psf: point spread function of single fluorscent bead on different z slices,
+         should be normalized to sum(psf) = 1
+    obj_0: reconstructed object for first iteration. defaults to np.ones if None
+    n_iter: number of iterations
+    roi_size: xy shape of reconstructed volume
+
+    """
+
+    if verbose:
+        print("Initializing memory")
+    size_z = psf.shape[0]
+    assert psf.shape[1] == psf.shape[2]
+    xy_pad = (psf.shape[1]-roi_size)//2
+
+    assert np.isclose(psf.sum(axis=(1,2)),1.0, atol=1e-5).all(), "PSF not normalized, normalize using / psf.sum"
+    psf_flipped = psf[:,::-1,::-1]
+    # psf_flipped = np.zeros_like(psf)
+    # for z in range(size_z):
+        # psf_flipped = np.fft.ifft(np.fft.fft2(psf[:, :, z]).conj().T)
+
+    obj_recon = obj_0 if obj_0 is not None else np.ones((size_z,roi_size, roi_size), dtype=np.float32)
+
+    img_estimate_temp = np.zeros_like(img)
+    slice_temp = np.zeros_like(img)
+    losses = np.zeros(n_iter)
+    if plot:
+        pad = 10
+        plot_mip = np.zeros(shape = (roi_size+size_z+3*pad, roi_size+size_z+3*pad))
+
+
+    if verbose:
+        print("finished initializing memory")
+        loop = tqdm(range(n_iter))
+    else:
+        loop = range(n_iter)
+    for it in loop:
+        img_estimate_temp.fill(0)
+        loss = 0
+        for z in range(size_z):
+            slice_temp[xy_pad:xy_pad+roi_size,xy_pad:xy_pad+roi_size] = obj_recon[z,:, :]
+            forward_pass = fftconvolve(slice_temp, psf[z,:,:],  mode="same")
+            img_estimate_temp += forward_pass
+
+        img_ratio_temp = (img / img_estimate_temp + np.finfo(img.dtype).eps)
+
+        for z in range(size_z):
+            back_pass = fftconvolve(img_ratio_temp, psf_flipped[z,:,:], mode="same")
+            obj_recon[z,:,:] *= back_pass[xy_pad:xy_pad+roi_size,xy_pad:xy_pad+roi_size]
+            loss += np.mean(back_pass[xy_pad:xy_pad+roi_size,xy_pad:xy_pad+roi_size])
+
+        losses[it] = loss/size_z
+
+        if plot:
+            plot_mip[pad:pad+roi_size,pad:pad+roi_size] = obj_recon.max(axis=0)
+            plot_mip[2*pad+roi_size:2*pad+roi_size+size_z, pad:pad+roi_size] = obj_recon.max(axis=1)
+            plot_mip[pad:pad+roi_size,2*pad+roi_size:2*pad+roi_size+size_z] = obj_recon.max(axis=2).T
+            plt.imshow(plot_mip, cmap='binary')
+
+
+    return obj_recon, losses
+
+def reconstruct_volume_gpu(img,
+                           psf,
+                           obj_0=None,
+                           n_iter=30,
+                           roi_size=600,
+                           verbose=True,
+                           plot=False,
+                           ):
+    """
+    img: LFM image: 2d array
+    psf: point spread function of single fluorscent bead on different z slices,
+         should be normalized to sum(psf) = 1
+    obj_0: reconstructed object for first iteration. defaults to np.ones if None
+    n_iter: number of iterations
+    roi_size: xy shape of reconstructed volume
+
+    """
+    from cupyx.scipy.signal import fftconvolve
+    if verbose:
+        print("Initializing memory")
+    size_z = psf.shape[0]
+    assert psf.shape[1] == psf.shape[2]
+    xy_pad = (psf.shape[1]-roi_size)//2
+
+    img = cp.array(img)
+    psf = cp.array(psf)
+
+    assert cp.isclose(psf.sum(axis=(1,2)),1.0, atol=1e-5).all(), "PSF not normalized, normalize using / psf.sum"
+    psf_flipped = psf[:,::-1,::-1]
+    # psf_flipped = np.zeros_like(psf)
+    # for z in range(size_z):
+        # psf_flipped = np.fft.ifft(np.fft.fft2(psf[:, :, z]).conj().T)
+
+    obj_recon = obj_0 if obj_0 is not None else cp.ones((size_z,roi_size, roi_size), dtype=cp.float32)
+
+    img_estimate_temp = cp.zeros_like(img)
+    slice_temp = cp.zeros_like(img)
+    losses = cp.zeros(n_iter)
+    if plot:
+        pad = 10
+        plot_mip = cp.zeros(shape = (n_iter,roi_size+size_z+3*pad, roi_size+size_z+3*pad))
+
+    if verbose:
+        print("Finished initializing memory")
+        loop = tqdm(range(n_iter), "Main loop", position=0,leave=True)
+        forward_projection = tqdm(range(size_z),"Forward Projection",position=1,leave=False)
+        back_projection = tqdm(range(size_z),"Back Projection",position=1,leave=False)
+    else:
+        loop = range(n_iter)
+    forward_projection = range(size_z)
+    back_projection = range(size_z)
+
+    for it in loop:
+        img_estimate_temp.fill(0)
+        loss = 0
+        for z in forward_projection:
+            slice_temp[xy_pad:xy_pad+roi_size,xy_pad:xy_pad+roi_size] = obj_recon[z,:, :]
+            forward_pass = fftconvolve(slice_temp, psf[z,:,:],  mode="same")
+            img_estimate_temp += forward_pass
+
+        img_ratio_temp = (img / img_estimate_temp + cp.finfo(img.dtype).eps)
+
+        for z in back_projection:
+            back_pass = fftconvolve(img_ratio_temp, psf_flipped[z,:,:], mode="same")
+            obj_recon[z,:,:] *= back_pass[xy_pad:xy_pad+roi_size,xy_pad:xy_pad+roi_size]
+            loss += cp.mean(back_pass[xy_pad:xy_pad+roi_size,xy_pad:xy_pad+roi_size])
+
+        losses[it] = loss/size_z
+
+        if plot:
+            plot_mip[it,pad:pad+roi_size,pad:pad+roi_size] = obj_recon.max(axis=0)
+            plot_mip[it,2*pad+roi_size:2*pad+roi_size+size_z, pad:pad+roi_size] = obj_recon.max(axis=1)
+            plot_mip[it,pad:pad+roi_size,2*pad+roi_size:2*pad+roi_size+size_z] = obj_recon.max(axis=2).T
+            plt.imshow(plot_mip[it].get(), cmap='binary')
+
+
+    return obj_recon, losses, plot_mip

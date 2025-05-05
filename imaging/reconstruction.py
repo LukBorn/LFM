@@ -209,13 +209,13 @@ def reconstruct_volume_gpu(img,
 
     if verbose:
         print("Finished initializing memory")
-        loop = tqdm(range(n_iter), "Main loop", position=0,leave=True)
-        forward_projection = tqdm(range(size_z),"Forward Projection",position=1,leave=False)
-        back_projection = tqdm(range(size_z),"Back Projection",position=1,leave=False)
+        loop = tqdm(range(n_iter), "Main loop")
+        forward_projection = tqdm(range(size_z),"Forward Projection",leave=False)
+        back_projection = tqdm(range(size_z),"Back Projection",leave=False)
     else:
         loop = range(n_iter)
-    forward_projection = range(size_z)
-    back_projection = range(size_z)
+        forward_projection = range(size_z)
+        back_projection = range(size_z)
 
     for it in loop:
         img_estimate_temp.fill(0)
@@ -238,7 +238,74 @@ def reconstruct_volume_gpu(img,
             plot_mip[it,pad:pad+roi_size,pad:pad+roi_size] = obj_recon.max(axis=0)
             plot_mip[it,2*pad+roi_size:2*pad+roi_size+size_z, pad:pad+roi_size] = obj_recon.max(axis=1)
             plot_mip[it,pad:pad+roi_size,2*pad+roi_size:2*pad+roi_size+size_z] = obj_recon.max(axis=2).T
-            plt.imshow(plot_mip[it].get(), cmap='binary')
+            # plt.imshow(plot_mip[it].get(), cmap='binary')
 
 
     return obj_recon, losses, plot_mip
+
+
+def generate_random_gaussians_3d(shape,
+                                 sparseness=0.01,  # fraction of voxels that contain Gaussians
+                                 intensity_dist=(50, 200),  # (min, max) for uniform distribution
+                                 sigma_dist=(2, 5),  # (min, max) for standard deviations
+                                 seed=None):
+    """
+    Generate a 3D volume with randomly placed 3D Gaussian kernels.
+
+    Parameters:
+    -----------
+    shape: tuple
+        Shape of the output volume (depth, height, width)
+    sparseness: float
+        Fraction of voxels that contain Gaussian kernels (0-1)
+    intensity_dist: tuple
+        (min, max) for uniform intensity distribution
+    sigma_dist: tuple
+        (min, max) for standard deviation of Gaussians
+    seed: int
+        Random seed for reproducibility
+
+    Returns:
+    --------
+    volume: cp.ndarray
+        3D volume with Gaussian kernels
+    """
+    if seed is not None:
+        np.random.seed(seed)
+        cp.random.seed(seed)
+
+    # Create empty volume
+    volume = cp.zeros(shape, dtype=cp.float32)
+    depth, height, width = shape
+
+    # Calculate number of Gaussians based on sparseness
+    total_voxels = depth * height * width
+    n_gaussians = int(total_voxels * sparseness)
+
+    # Generate random positions
+    positions = np.random.randint(n_gaussians, 3) * np.array([depth, height, width])
+
+    # Generate random intensities and sigmas
+    intensities = np.random.uniform(intensity_dist[0], intensity_dist[1], n_gaussians)
+    sigmas = np.random.uniform(sigma_dist[0], sigma_dist[1], (n_gaussians, 3))
+
+    # Create coordinate grids
+    z_indices, y_indices, x_indices = cp.mgrid[:depth, :height, :width]
+
+    # Add each Gaussian to the volume
+    for i in range(n_gaussians):
+        z_pos, y_pos, x_pos = positions[i]
+        sigma_z, sigma_y, sigma_x = sigmas[i]
+        intensity = intensities[i]
+
+        # Calculate 3D Gaussian
+        gaussian = intensity * cp.exp(
+            -((z_indices - z_pos) ** 2 / (2 * sigma_z ** 2) +
+              (y_indices - y_pos) ** 2 / (2 * sigma_y ** 2) +
+              (x_indices - x_pos) ** 2 / (2 * sigma_x ** 2))
+        )
+
+        # Add to volume
+        volume += gaussian
+
+    return volume

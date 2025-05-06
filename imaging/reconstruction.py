@@ -4,95 +4,68 @@ import scipy.signal
 from pyqtgraph.examples.logAxis import plotdata
 from tqdm.auto import tqdm
 from numpy.fft import fft2 as np_fft2, ifft2 as np_ifft2, fftshift as np_fftshift, ifftshift as np_ifftshift
-from cupy.fft import fft2 as cp_fft2, ifft2 as cp_ifft2, fftshift as cp_fftshift, ifftshift as cp_ifftshift
-
+from cupy.fft import fft2 as cp_fft2, ifft2
 import time
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from scipy.signal import fftconvolve
 
+from lfm.util import create_projection_image
 
 
-def reconstruct_vol_from_img(img,
-                             psf1,
-                             psf2,
-                             n_iter=30,
-                             ratio=0.5,
-                             xy_pad=201,
-                             roi_size=300,
-                             verbose=True,
-                             gpu=False
-                             ):
-    if gpu:
-        xp = cp
-        fft2, ifft2, fftshift, ifftshift = cp_fft2, cp_ifft2, cp_fftshift, cp_ifftshift
-    else:
-        xp = np
-        fft2, ifft2, fftshift, ifftshift = np_fft2, np_ifft2, np_fftshift, np_ifftshift
+def reconstruct_vol_from_img_gpu(img,
+                                 psf,
+                                 n_iter=30,
+                                 ratio=0.5,
+                                 xy_pad=201,
+                                 roi_size=300,
+                                 verbose=True,
+                                 pad=10
+                                 ):
+    from cupy.fft import fft2, ifft2, fftshift, ifftshift
 
-    size_x = psf1.shape[0] + 2 * xy_pad
-    size_y = psf1.shape[1] + 2 * xy_pad
-    size_z = psf1.shape[2]
+    size_y = psf.shape[1] + 2 * xy_pad
+    size_x = psf.shape[2] + 2 * xy_pad
+    size_z = psf.shape[0]
 
     if verbose:
         print("Initializing memory")
 
-    OTF = xp.zeros((size_x, size_y, size_z), dtype=xp.complex64)
-
+    OTF = cp.zeros((size_z, size_y, size_x), dtype=cp.complex64)
 
     for i in range(size_z):
-        OTF[:, :, i] = fft2(ifftshift(xp.pad(psf1[:, :, i], ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')))
+        OTF[i, :, :] = fft2(ifftshift(cp.pad(psf[i, :, :], ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')))
 
-    size_add = round((size_x / ratio - size_x) / 2)
-    size_sub = round(size_x * (1 - ratio) / 2) + size_add
+    img_padded = cp.pad(img, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')
 
-    temp_1 = xp.zeros((size_x + 2 * size_add, size_y + 2 * size_add), dtype=xp.complex64)
-    temp_2 = xp.zeros_like(temp_1, dtype=xp.float32)
-    temp_3 = xp.zeros((size_x, size_y), dtype=xp.float32)
-
-    img_padded = xp.pad(img, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')
-
-    temp_obj = xp.zeros((size_x, size_y), dtype=xp.float32)
-    obj_recon = xp.ones((2 * roi_size, 2 * roi_size, size_z), dtype=xp.float32)
-    img_est = xp.zeros((size_x, size_y), dtype=xp.float32)
-    ratio_img = xp.zeros((size_x, size_y), dtype=xp.float32)
+    temp_obj = cp.zeros((size_y, size_x), dtype=cp.float32)
+    obj_recon = cp.ones((size_z, 2 * roi_size, 2 * roi_size), dtype=cp.float32)
+    img_est = cp.zeros((size_y, size_x), dtype=cp.float32)
+    ratio_img = cp.zeros((size_y, size_x), dtype=cp.float32)
+    plot_mip = np.zeros(shape=(n_iter, 2*roi_size + size_z + 3 * pad, 2*roi_size + size_z + 3 * pad), dtype=cp.float32)
 
     for it in tqdm(range(n_iter)):
         img_est.fill(0)
 
         for z in range(size_z):
-            temp_obj[size_x // 2 - roi_size: size_x // 2 + roi_size,
-            size_y // 2 - roi_size: size_y // 2 + roi_size] = obj_recon[:, :, z]
-            temp_1[size_add:-size_add, size_add:-size_add] = fftshift(fft2(temp_obj))
-            temp_2 = xp.abs(ifft2(ifftshift(temp_1)))
-            img_est += xp.maximum(xp.real(ifft2(OTF_A[:, :, z] * fft2(temp_obj))), 0)
-            img_est += xp.maximum(xp.real(ifft2(OTF_B[:, :, z] * fft2(temp_2[size_add:-size_add, size_add:-size_add]))),
-                                  0)
+            temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
+            img_est += cp.maximum(cp.real(ifft2(OTF[z, :, :] * fft2(temp_obj))), 0)
 
-        temp_4 = img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] / (
-                    img_est[xy_pad:-xy_pad, xy_pad:-xy_pad] + xp.finfo(xp.float32).eps)
-        ratio_img.fill(xp.mean(temp_4, dtype=xp.float32))
-        ratio_img *= (img_est > (xp.max(img_est) / 200)).astype(xp.float32)
+        # temp_4 = img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] / (
+        #             img_est[xy_pad:-xy_pad, xy_pad:-xy_pad] + cp.finfo(cp.float32).eps)
+        # ratio_img[img_est > (cp.max(img_est) / 200)].fill(cp.mean(temp_4, dtype=cp.float32))
+        # # ratio_img.fill(cp.mean(temp_4, dtype=cp.float32))
+        # # ratio_img *= (img_est > (cp.max(img_est) / 200)).astype(cp.float32)
         ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad] = img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] / (
-                    img_est[xy_pad:-xy_pad, xy_pad:-xy_pad] + xp.finfo(xp.float32).eps)
-
-        temp_2.fill(0)
+                    img_est[xy_pad:-xy_pad, xy_pad:-xy_pad] + cp.finfo(cp.float32).eps)
 
         for z in range(size_z):
-            temp_1[size_add:-size_add, size_add:-size_add] = fftshift(fft2(ratio_img) * xp.conj(OTF_B[:, :, z]))
-            temp_2[size_sub:-size_sub, size_sub:-size_sub] = xp.abs(
-                ifft2(ifftshift(temp_1[size_sub:-size_sub, size_sub:-size_sub])))
-            temp_obj[size_x // 2 - roi_size: size_x // 2 + roi_size,
-                    size_y // 2 - roi_size: size_y // 2 + roi_size] = obj_recon[:, :, z]
-            temp_3 = temp_obj * (xp.maximum(xp.real(ifft2(fft2(ratio_img) * xp.conj(OTF_A[:, :, z]))), 0) + temp_2[
-                                                                                                            size_add:-size_add,
-                                                                                                            size_add:-size_add]) / 2
-            obj_recon[:, :, z] = temp_3[size_x // 2 - roi_size: size_x // 2 + roi_size,
-                                 size_y // 2 - roi_size: size_y // 2 + roi_size]
+            temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
+            temp = temp_obj * (cp.maximum(cp.real(ifft2(fft2(ratio_img) * cp.conj(OTF[z, :, :]))), 0))
+            obj_recon[z, :, :] = temp[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size]
+        plot_mip[it,:,:] = create_projection_image(obj_recon.get(),np.max,pad)
 
-
-
-    return obj_recon
+    return obj_recon, plot_mip
 
 def reconstruct_volume_cpu(img,
                            psf,
@@ -172,6 +145,7 @@ def reconstruct_volume_gpu(img,
                            roi_size=600,
                            verbose=True,
                            plot=False,
+                           pad = 10
                            ):
     """
     img: LFM image: 2d array
@@ -186,8 +160,8 @@ def reconstruct_volume_gpu(img,
     if verbose:
         print("Initializing memory")
     size_z = psf.shape[0]
-    assert psf.shape[1] == psf.shape[2]
-    xy_pad = (psf.shape[1]-roi_size)//2
+    y_pad = (psf.shape[1]-roi_size)//2
+    x_pad = (psf.shape[2]-roi_size)//2
 
     img = cp.array(img)
     psf = cp.array(psf)
@@ -204,8 +178,10 @@ def reconstruct_volume_gpu(img,
     slice_temp = cp.zeros_like(img)
     losses = cp.zeros(n_iter)
     if plot:
-        pad = 10
-        plot_mip = cp.zeros(shape = (n_iter,roi_size+size_z+3*pad, roi_size+size_z+3*pad))
+
+        plot_mip = np.zeros(shape = (n_iter,roi_size + size_z + 3*pad,roi_size + size_z + 3*pad), dtype=cp.float32)
+    else:
+        plot_mip = None
 
     if verbose:
         print("Finished initializing memory")
@@ -221,7 +197,7 @@ def reconstruct_volume_gpu(img,
         img_estimate_temp.fill(0)
         loss = 0
         for z in forward_projection:
-            slice_temp[xy_pad:xy_pad+roi_size,xy_pad:xy_pad+roi_size] = obj_recon[z,:, :]
+            slice_temp[y_pad:y_pad+roi_size,x_pad:x_pad+roi_size] = obj_recon[z,:, :]
             forward_pass = fftconvolve(slice_temp, psf[z,:,:],  mode="same")
             img_estimate_temp += forward_pass
 
@@ -229,19 +205,17 @@ def reconstruct_volume_gpu(img,
 
         for z in back_projection:
             back_pass = fftconvolve(img_ratio_temp, psf_flipped[z,:,:], mode="same")
-            obj_recon[z,:,:] *= back_pass[xy_pad:xy_pad+roi_size,xy_pad:xy_pad+roi_size]
-            loss += cp.mean(back_pass[xy_pad:xy_pad+roi_size,xy_pad:xy_pad+roi_size])
+            obj_recon[z,:,:] *= back_pass[y_pad:y_pad+roi_size,x_pad:x_pad+roi_size]
+            loss += cp.mean(back_pass[y_pad:y_pad+roi_size,x_pad:x_pad+roi_size])
 
         losses[it] = loss/size_z
 
         if plot:
-            plot_mip[it,pad:pad+roi_size,pad:pad+roi_size] = obj_recon.max(axis=0)
-            plot_mip[it,2*pad+roi_size:2*pad+roi_size+size_z, pad:pad+roi_size] = obj_recon.max(axis=1)
-            plot_mip[it,pad:pad+roi_size,2*pad+roi_size:2*pad+roi_size+size_z] = obj_recon.max(axis=2).T
-            # plt.imshow(plot_mip[it].get(), cmap='binary')
-
+            plot_mip[it,:,:] = create_projection_image(obj_recon.get(),np.max,pad)
 
     return obj_recon, losses, plot_mip
+
+
 
 
 def generate_random_gaussians_3d(shape,

@@ -8,17 +8,21 @@ def volume_to_gif(volume, gif_path="output.gif", cmap="gray", fps=10, vmin=None,
     images = []
 
     for i in tqdm(range(volume.shape[0])):
-        fig, ax = plt.subplots()
-        canvas = FigureCanvas(fig)
-        ax.axis("off")
-        im = ax.imshow(volume[i], cmap=cmap, vmin=vmin, vmax=vmax)
-        canvas.draw()
+        # Normalize the image data
+        frame = volume[i]
+        if vmin is None:
+            vmin = frame.min()
+        if vmax is None:
+            vmax = frame.max()
+        normalized_frame = (frame - vmin) / (vmax - vmin)
+        normalized_frame = (normalized_frame * 255).astype(np.uint8)
 
-        # Convert canvas to image
-        image = np.frombuffer(canvas.buffer_rgba(), dtype='uint8')
-        image = image.reshape(canvas.get_width_height()[::-1] + (4,))
-        images.append(image)
-        plt.close(fig)
+        # Apply colormap
+        colormap = plt.get_cmap(cmap)
+        colored_frame = colormap(normalized_frame)
+        colored_frame = (colored_frame[:, :, :3] * 255).astype(np.uint8)  # Drop alpha channel
+
+        images.append(colored_frame)
 
     imageio.mimsave(gif_path, images, fps=fps, loop = 0)
     print(f"GIF saved to: {gif_path}")
@@ -54,8 +58,8 @@ def create_projection_image(volume, projection_func=None, pad=10):
     depth, height, width = volume.shape
 
     # Calculate output dimensions with padding
-    output_height = height + depth + 2 * pad
-    output_width = width + depth + 2 * pad
+    output_height = height + depth + 3 * pad
+    output_width = width + depth + 3 * pad
 
     # Create empty output image (using same array type as input)
     output = np.zeros((output_height, output_width), dtype=volume.dtype)

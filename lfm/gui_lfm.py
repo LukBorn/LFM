@@ -263,6 +263,8 @@ if __name__ == "__main__":
             lfm.grab_psf(di.to_dict())
         elif name == "preview_psf":
             lfm.preview_psf(di.to_dict())
+        elif name == "control_stage":
+            lfm.start_control_stage(di.to_dict())
         else:
             print(f"did not understand {name}")
         setOptsRecursive(di.p, enabled=True)
@@ -285,6 +287,9 @@ if __name__ == "__main__":
             beam_array=lambda d: button_callback("beam_array"),
             point=lambda d: button_callback("point"),
         )
+    )
+    params_dict["hardware"].update(
+        control_stage = lambda d: button_callback("control_stage"),
     )
     params_dict["psf"].update(
         dict(

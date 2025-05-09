@@ -12,6 +12,7 @@ import pyqtgraph as pg
 from tqdm.auto import tqdm
 
 from nidaqmx.utils import flatten_channel_string, unflatten_channel_string
+from ui.stage_controls import StageControlWindow
 
 
 N_BACKGROUND_FRAMES = 100
@@ -157,6 +158,7 @@ class LFM:
         logger.info("Initializing Stage")
         from stage import StandaStage, get_connected_axes
         from stage_old import sutterMP285
+        self.stage_active = True
         if conf["stage"]["type"] == "standa":
             self.stage = StandaStage(uris=get_connected_axes(),
                                      calibration=conf["stage"]["calibration"],
@@ -164,6 +166,18 @@ class LFM:
                                      verbose=verbose)
         elif conf["psf"]["stage_type"] == "sutter":
             self.stage = sutterMP285("COM4")
+            logger.warning("Stage not fully implemented, please use Standa stage")
+        else:
+            logger.warning("Stage type not supported (must be either 'standa' or 'sutter')")
+
+    def uninit_stage(self, conf):
+        if conf["stage"]["type"] == "standa":
+            self.stage.close()
+            self.stage_active = False
+        if conf["stage"]["type"] == "sutter":
+            self.stage.close()
+            self.stage_active = False
+            logger.warning("Stage not fully implemented, please use Standa stage")
         else:
             logger.warning("Stage type not supported (must be either 'standa' or 'sutter')")
 
@@ -184,9 +198,26 @@ class LFM:
         original_pos = self.stage.get_position(verbose=True)
 
         _, _, ao_single, do_single, ft = get_full_waveforms(conf,ft=conf["psf"]["exposure_ms"]/1000)
-        psf = np.zeros(shape=(conf["psf"]["z_layers"], self.cam.frame_shape[0], self.cam.frame_shape[1]))
 
-        z_positions = np.zeros(shape=(conf["psf"]["z_layers"]))
+        self.cam.set_trigger(external=True, each_frame=False)
+        logger.info(f"Exposure time{self.cam.exposure_time*1000}ms")
+
+        if conf["psf"]["name_suffix"].strip() != "":
+            # create directory, save metadata and open HDF5 file
+            dirname = arrow.now().format("YYYYMMDD_HHmm") + "_PSF_" + conf['psf']['name_suffix']
+            p_target = os.path.join(conf['psf']['base_directory'], dirname)
+
+            if not os.path.exists(p_target):
+                os.mkdir(p_target)
+            else:
+                logger.error('Directory exists! aborting')
+                return
+            fn = os.path.join(p_target, "psf.h5")
+            logger.info(f"Saving PSF to {fn}")
+            with h5py.File(fn, 'w') as fh5:
+                fh5.create_dataset("bg", data = bg_im)
+                fh5.create_dataset("psf", data = np.zeros(shape=(conf["psf"]["z_layers"], self.cam.frame_shape[0], self.cam.frame_shape[1])))
+                fh5.create_dataset("z_positions", data = np.zeros(shape=(conf["psf"]["z_layers"])))
 
         # Create a main window with layout
         main_window = pg.Qt.QtWidgets.QWidget()
@@ -208,14 +239,11 @@ class LFM:
         z_label = pg.Qt.QtWidgets.QLabel()
         layout.addWidget(z_label)  # Add QLabel below the image
 
-        self.cam.set_trigger(external=True, each_frame=False)
-        logger.info(f"Exposure time{self.cam.exposure_time*1000}ms")
 
         with self.dao.queue_data(ao_single, do_single, finite=False, chunked=False):
             outer = tqdm(range(conf["psf"]["z_layers"]),f"Acquiring PSF of {conf["psf"]["z_layers"]} layers with distance {conf["psf"]["z_distance_mm"]}mm",position=0, leave=True)
             for z in range(conf["psf"]["z_layers"]): #tdqm(range(conf["psf"]["z_layers"]),f"Acquiring PSF of {conf["psf"]["z_layers"]}layers with distance {conf["psf"]["z_distance_mm"]}mm"):
                 z_pos = self.stage.get_position(verbose=False)[2]
-                z_positions[z] = z_pos
                 z_label.setText(f"Relative Z Position: {original_pos[2] - z_pos:.3f} mm")
                 pg.Qt.QtWidgets.QApplication.processEvents()
                 avg_frame = np.zeros(shape=(conf["psf"]["n_frames"],self.cam.frame_shape[0], self.cam.frame_shape[1]))
@@ -229,35 +257,27 @@ class LFM:
                     logger.warning(f"Acquisition interrupted after layer {z}.")
                     self.interrupt_flag = True
                     break
+                if conf["psf"]["name_suffix"].strip() != "":
+                    with h5py.File(fn, 'a') as fh5:
+                        fh5["psf"][z, :, :] = avg_frame.mean(axis=0)
+                        fh5["z_positions"][z] = z_pos
 
-                psf[z, :, :] = avg_frame.mean(axis=0)
                 self.stage.move((0, 0, -conf["psf"]["z_distance_mm"]))
 
         self.stage.move_to(original_pos, verbose= True)
-        self.stage.close()
+        self.uninit_stage(conf)
         self.point()
 
-        if conf["psf"]["name_suffix"].strip() != "" or self.interrupt_flag:
-            # create directory, save metadata and open HDF5 file
-            dirname = arrow.now().format("YYYYMMDD_HHmm") + "_PSF_" + conf['psf']['name_suffix']
-            p_target = os.path.join(conf['psf']['base_directory'], dirname)
-
-            if not os.path.exists(p_target):
-                os.mkdir(p_target)
-            else:
-                logger.error('Directory exists! aborting')
-                return
-            fn = os.path.join(p_target, "psf.h5")
-            logger.info(f"Saving PSF to {fn}")
-            with h5py.File(fn, 'w') as fh5:
-                fh5.create_dataset("bg", data=bg_im)
-                fh5.create_dataset("psf", data=psf)
-                fh5.create_dataset("z_positions", data=z_positions)
+        if self.interrupt_flag:
+            self.stage.move_to(original_pos, verbose=True)
+            self.uninit_stage()
+            self.point()
             self.interrupt_flag = False
+
         logger.info(f"PSF acquisition complete.")
 
     def preview_psf(self, conf):
-        #todo add stage controls
+        self.start_control_stage(conf)
         self.cam.frame_dtype = conf["camera"]["dtype"]
         self.cam.exposure_time = conf["psf"]["exposure_ms"] / 1000
         _, _, ao_single, do_single, ft = get_full_waveforms(conf,ft=conf["psf"]["exposure_ms"]/1000)
@@ -293,11 +313,9 @@ class LFM:
         logger.info(f"Preview stopped")
 
 
-
     def acquire_timelapse(self, conf):
         """Acquire a timelapse.
         """
-        self.cam.frame_dtype = conf["camera"]["dtype"]
 
         # create directory, save metadata and open HDF5 file
         dirname = arrow.now().format("YYYYMMDD_HHmm_") + conf['acquisition']['name_suffix']
@@ -319,6 +337,7 @@ class LFM:
         # collect background frame
         logger.info('Acquiring background frame...')
         self.cam.frame_dtype = conf["camera"]["dtype"]
+        self.cam.exposure_time = 1/(conf["camera"]["recording_fps"]*1000)
         self.cam.set_trigger(external=False, each_frame=True) #internal trigger because were aquiring stack not streaming data?
         bg_im = self.cam.acquire_stack(N_BACKGROUND_FRAMES)[0].mean(0, dtype='float32')
         with h5py.File(fn, 'w') as fh5:
@@ -414,6 +433,19 @@ class LFM:
         else:
             logger.info(f"Acquisition complete.")
             
+    def start_control_stage(self, conf):
+        if self.stage_active:
+            logger.warning("Stage already active")
+            return
+        self.init_stage(conf, verbose=False)
+        self.stage_window = StageControlWindow()
+        # Example: connect button signals to LFM methods or lambdas
+        self.stage_window.ui.buttonforward.clicked.connect(lambda: self.stage.move_up())
+        self.stage_window.ui.buttonback.clicked.connect(lambda: self.stage.move_down())
+
+
+        self.stage_window.show()
+
 
     def load_stimdata(self, p, filename, conf):
         """Load stimulus data from file.

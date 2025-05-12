@@ -299,7 +299,6 @@ class LFM:
         fn = os.path.join(p_target, "data.h5")
         #fh5 = h5py.File(fn, "w")
 
-
         # collect background frame
         logger.info('Acquiring background frame...')
         self.cam.frame_dtype = conf["camera"]["dtype"]
@@ -311,10 +310,12 @@ class LFM:
         with h5py.File(fn, 'w') as fh5:
             fh5.create_dataset("bg", data=bg_im)
 
-        # setup camera acquisition
-
-        self.cam.set_trigger(external=True, each_frame=False)
-
+        # setup DAQ
+        conf["acquisition"]["ramp_seconds"] = 1 if conf["acquisition"]["ramp_seconds"] == 0 else \
+        conf["acquisition"]["ramp_seconds"]
+        ao_full, do_full, ao_single, do_single = get_full_waveforms(conf, fps=int(1 / self.cam.exposure_time))
+        stim_delay_sec = conf['acquisition']['ramp_seconds']
+        logger.info(f"waveforms gotten")
 
         # create dataset
         logger.info('Set up image dataset...')
@@ -328,7 +329,8 @@ class LFM:
                                               dtype=stack_dtype,
                                               shape=stack_shape,
                                               chunk_shape=(1, *self.cam.frame_shape),
-                                              num_workers=8)
+                                              num_workers=8
+                                              )
         else:
             writer = VanillaWriter(fn=fn,
                                    name="data",
@@ -337,20 +339,21 @@ class LFM:
         logger.info(f"Dataset with shape {stack_shape} and dtype {stack_dtype} created in {fn}")
 
         # set up preview
-        preview_callback, imv = get_preview_callback(self.cam.frame_shape, 
-                                                     window_title='Acquisition preview',
-                                                     refresh_every=30)
-        pg.Qt.QtWidgets.QApplication.processEvents(pg.Qt.QtCore.QEventLoop.AllEvents, 100)
+        preview_window = PreviewWindow()
+        preview_window.update(bg_im)
+        def preview_callback(im, ii, timestamp, frame_number):
+            if ii % 5 == 0:
+                preview_window.update(im)
 
-        
         def interrupt():
-            if not imv.isVisible():
-                self.interrupt_flag = True
-            return self.interrupt_flag 
+            self.interrupt_flag = True
+            return not preview_window.isVisible()
 
+        logger.info("callbacks defined")
         # define callback function
         tstmp = np.ones(n_frames, dtype=np.float64) * np.nan
         nfrm = np.zeros(n_frames, dtype=np.int64) - 1
+        logger.info("timestamp array defined")
 
         def callback(im, ii, timestamp, frame_number):
             frame_number -= n_ramp_frames 
@@ -366,12 +369,8 @@ class LFM:
             preview_callback(im, ii, timestamp, frame_number)
 
         #start camera aquisition
-        self.cam.arm()
-
-        # setup DAQ
-        conf["acquisition"]["ramp_seconds"] = 1 if conf["acquisition"]["ramp_seconds"] == 0 else conf["acquisition"]["ramp_seconds"],
-        ao_full, do_full, ao_single, do_single = get_full_waveforms(conf)
-        stim_delay_sec = conf['acquisition']['ramp_s']
+        self.cam.set_trigger(external=True, each_frame=False)
+        logger.info("Arming camera...")
 
         # run (with statement manages DAO start and cleanup)
         logger.info(f"Starting acquisition of {n_frames} frames after a ramp of {n_ramp_frames} ...")
@@ -380,12 +379,10 @@ class LFM:
             with self.dao.queue_data(ao_full, do_full, finite=True, chunked=True), writer:
                 self.cam.stream(num_frames=n_ramp_frames+n_frames,
                                 callback=callback, 
-                                already_armed=True, 
+                                already_armed=False,
                                 interrupt=interrupt)
         
         self.point()
-
-        imv.close()
 
         # stop camera
         self.cam.disarm()
@@ -398,7 +395,9 @@ class LFM:
         if self.interrupt_flag:
             logger.warning(f"Acquisition interrupted after frame {nfrm.max()}.")
             self.interrupt_flag = False
+            preview_window.close()
         else:
+            preview_window.close()
             logger.info(f"Acquisition complete.")
             
     def start_control_stage(self, conf):

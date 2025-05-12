@@ -1,4 +1,5 @@
 import numpy as np
+import cupy as cp
 import imageio
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
@@ -50,10 +51,6 @@ def create_projection_image(volume, projection_func=None, pad=10):
         - xz at the bottom
         - yz on the right side
     """
-    # Default to max projection if no function provided
-    if projection_func is None:
-        projection_func = np.max
-
     # Get dimensions
     depth, height, width = volume.shape
 
@@ -62,21 +59,24 @@ def create_projection_image(volume, projection_func=None, pad=10):
     output_width = width + depth + 3 * pad
 
     # Create empty output image (using same array type as input)
-    output = np.zeros((output_height, output_width), dtype=volume.dtype)
+    if isinstance(volume, np.ndarray):
+        output = np.zeros((output_height, output_width), dtype=volume.dtype)
+        if projection_func is None:
+            projection_func = np.max
+    elif isinstance(volume, cp.ndarray):
+        output = cp.zeros((output_height, output_width), dtype=volume.dtype)
+        if projection_func is None:
+            projection_func = cp.max
+    else:
+        raise TypeError("Volume must be of type cp.ndarray or cp.ndarray")
 
-    # Create projections
-    xy_proj = projection_func(volume, axis=0)  # Top-down view
-    xz_proj = projection_func(volume, axis=1)  # Front view
-    yz_proj = projection_func(volume, axis=2)  # Side view
-
-    # Place projections in output image
     # XY projection (center)
-    output[pad:pad + height, pad:pad + width] = xy_proj
+    output[pad:pad + height, pad:pad + width] = projection_func(volume, axis=0)
 
     # XZ projection (bottom)
-    output[pad + height + pad:pad + height + pad + depth, pad:pad + width] = xz_proj
+    output[pad + height + pad:pad + height + pad + depth, pad:pad + width] = projection_func(volume, axis=1)
 
     # YZ projection (right side) - needs transpose to align correctly
-    output[pad:pad + height, pad + width + pad:pad + width + pad + depth] = yz_proj.T
+    output[pad:pad + height, pad + width + pad:pad + width + pad + depth] = projection_func(volume, axis=2).T
 
     return output

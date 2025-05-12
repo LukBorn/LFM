@@ -5,7 +5,11 @@ acquisition:
   stimulus_file: ''
   ramp_seconds: 0
   recording_seconds: 10
-  led_percent: 50
+  led_percent: 100
+  fps: 80
+preview:
+  fps: 10
+  led_percent: 100
 camera:
   recording_fps: 80
   preview_fps: 10
@@ -25,12 +29,11 @@ psf:
   z_layers: 120
   z_distance_mm: 0.025
   n_frames: 10
-  exposure_ms: 500
+  fps: 2
 stage:
   type: 'standa' #"sutter"
   calibration: [.0025, .0025, .005]
   overshoot: 0.001
-  preview_move_mm: 0.01
 daq:
   rate: 50000
   device: 'Dev1'

@@ -9,9 +9,12 @@
 
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtWidgets import QMainWindow
 
 
-class StageControlWindow(object):
+
+
+class Ui_StageControlWindow(object):
     def setupUi(self, MainWindow):
         MainWindow.setObjectName("MainWindow")
         MainWindow.resize(521, 282)
@@ -38,11 +41,14 @@ class StageControlWindow(object):
         self.xmminput = QtWidgets.QTextEdit(self.centralwidget)
         self.xmminput.setGeometry(QtCore.QRect(360, 90, 151, 21))
         self.xmminput.setObjectName("xmminput")
+        self.xmminput.setPlainText("0.1")
         self.ymminput = QtWidgets.QTextEdit(self.centralwidget)
         self.ymminput.setGeometry(QtCore.QRect(360, 130, 151, 21))
+        self.ymminput.setPlainText("0.1")
         self.ymminput.setObjectName("ymminput")
         self.zmminput = QtWidgets.QTextEdit(self.centralwidget)
         self.zmminput.setGeometry(QtCore.QRect(360, 170, 151, 21))
+        self.zmminput.setPlainText("0.1")
         self.zmminput.setObjectName("zmminput")
         self.xlabel = QtWidgets.QLabel(self.centralwidget)
         self.xlabel.setGeometry(QtCore.QRect(310, 90, 51, 20))
@@ -54,15 +60,22 @@ class StageControlWindow(object):
         self.zlabel.setGeometry(QtCore.QRect(310, 170, 51, 20))
         self.zlabel.setObjectName("zlabel")
         self.poslabel = QtWidgets.QLabel(self.centralwidget)
-        self.poslabel.setGeometry(QtCore.QRect(310, 30, 46, 16))
+        self.poslabel.setGeometry(QtCore.QRect(310, 30, 247, 16))
         self.poslabel.setObjectName("poslabel")
-        self.posdisplay = QtWidgets.QTextBrowser(self.centralwidget)
-        self.posdisplay.setGeometry(QtCore.QRect(360, 30, 151, 21))
-        self.posdisplay.setObjectName("posdisplay")
+        # self.posdisplay = QtWidgets.QTextBrowser(self.centralwidget)
+        # self.posdisplay.setGeometry(QtCore.QRect(360, 30, 151, 21))
+        # self.posdisplay.setObjectName("posdisplay")
         MainWindow.setCentralWidget(self.centralwidget)
 
         self.retranslateUi(MainWindow)
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
+
+    def get_xmm(self):
+        return float(self.xmminput.toPlainText())
+    def get_ymm(self):
+        return float(self.ymminput.toPlainText())
+    def get_zmm(self):
+        return float(self.zmminput.toPlainText())
 
     def retranslateUi(self, MainWindow):
         _translate = QtCore.QCoreApplication.translate
@@ -77,3 +90,17 @@ class StageControlWindow(object):
         self.ylabel.setText(_translate("MainWindow", "mm per ↔:"))
         self.zlabel.setText(_translate("MainWindow", "mm per Z:"))
         self.poslabel.setText(_translate("MainWindow", "Position"))
+
+class StageControlWindow(QtWidgets.QMainWindow):
+    def __init__(self, on_close=None, conf=None, parent=None):
+        super().__init__(parent)
+        self.ui = Ui_StageControlWindow()
+        self.ui.setupUi(self)
+        self.on_close = on_close
+        self.conf = conf
+        self.show()
+
+    def closeEvent(self, event):
+        if self.on_close and self.conf:
+            self.on_close(self.conf)
+        super().closeEvent(event)

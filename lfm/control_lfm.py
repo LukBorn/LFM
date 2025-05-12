@@ -1,4 +1,5 @@
 import numpy as np
+import cupy as cp
 import os
 import arrow
 import json
@@ -14,6 +15,9 @@ from tqdm.auto import tqdm
 from nidaqmx.utils import flatten_channel_string, unflatten_channel_string
 from ui.stage_controls import StageControlWindow
 
+from cams import DCamera as Camera
+from daq import unifiedDAO
+from write import ParallelCompressedWriter, VanillaWriter
 
 N_BACKGROUND_FRAMES = 100
 
@@ -30,7 +34,7 @@ class SimpleArrayProxy:
             slices = (slices,)
         return self._custom_getitem(slices)
 
-def get_full_waveforms(conf,preview = False, ft = 0.01):
+def get_full_waveforms(conf,fps=None):
     ''' Generate full waveforms for the entire recording, including ramping. Note this uses SimpleArrayProxy to avoid storing the entire array in memory.
 
     Args:
@@ -42,12 +46,6 @@ def get_full_waveforms(conf,preview = False, ft = 0.01):
         arraylike: Control DO voltages array.
         float: Updated frame time in ms.
     '''
-    fps = conf['camera']['preview_fps'] if preview else conf['camera']['recording_fps']
-    frame_time = 1/fps
-    if ft is not None:
-        frame_time = ft
-        fps = int(1/ft)
-
     trigger_single = np.zeros((1,conf['daq']['rate']))
     for frame_start in range(0, conf['daq']['rate'], conf['daq']['rate']//fps):
         trigger_single[0,frame_start : frame_start + int((conf['camera']['cam_trig_width_ms'] / 1000) * conf['daq']['rate'])] = 1
@@ -76,7 +74,7 @@ def get_full_waveforms(conf,preview = False, ft = 0.01):
     led_full = SimpleArrayProxy(led_getter, shape=full_shape)
     trigger_full = SimpleArrayProxy(trigger_getter, shape=full_shape)
 
-    return led_full, trigger_full, led_single, trigger_single, frame_time
+    return led_full, trigger_full, led_single, trigger_single
 
 def get_preview_callback(im_shape, edge_sz=10, refresh_every=5, window_title='Preview'):
     """Return a callback function for generating an preview in an ImageView.
@@ -119,9 +117,6 @@ def get_preview_callback(im_shape, edge_sz=10, refresh_every=5, window_title='Pr
     return callback, imv
 
 
-from cams import DCamera as Camera
-from daq import unifiedDAO
-from write import ParallelCompressedWriter, VanillaWriter
 
 
 
@@ -139,6 +134,7 @@ class LFM:
         self.cam = Camera()
         self.point()
         self.interrupt_flag = False
+        self.stage_active = False
 
     def point(self):
         """
@@ -180,14 +176,22 @@ class LFM:
             logger.warning("Stage not fully implemented, please use Standa stage")
         else:
             logger.warning("Stage type not supported (must be either 'standa' or 'sutter')")
+            try:
+                self.stage.close()
+                logger.info("Stage closed")
+            except Exception as e:
+                logger.warning(f"Failed to close stage: {e}")
 
     def grab_psf(self, conf):
         """
         record the point spread function
         stage control and stuff
         """
+        if self.stage_active:
+            logger.warning("Close the stage controls before acquiring PSF")
+            return
         self.cam.frame_dtype = conf["camera"]["dtype"]
-        self.cam.exposure_time = conf["psf"]["exposure_ms"] / 1000
+        self.cam.exposure_time = 1/conf["psf"]["fps"]
 
         # collect background frame
         logger.info('Acquiring background frame...')
@@ -197,10 +201,10 @@ class LFM:
         self.init_stage(conf,verbose=False)
         original_pos = self.stage.get_position(verbose=True)
 
-        _, _, ao_single, do_single, ft = get_full_waveforms(conf,ft=conf["psf"]["exposure_ms"]/1000)
+        _, _, ao_single, do_single = get_full_waveforms(conf,fps = int(1/self.cam.exposure_time))
 
         self.cam.set_trigger(external=True, each_frame=False)
-        logger.info(f"Exposure time{self.cam.exposure_time*1000}ms")
+        logger.info(f"Exposure time: {self.cam.exposure_time*1000}ms")
 
         if conf["psf"]["name_suffix"].strip() != "":
             # create directory, save metadata and open HDF5 file
@@ -269,20 +273,23 @@ class LFM:
         self.point()
 
         if self.interrupt_flag:
-            self.stage.move_to(original_pos, verbose=True)
-            self.uninit_stage()
-            self.point()
+            # self.stage.move_to(original_pos, verbose=True)
+            # self.uninit_stage()
+            # self.point()
             self.interrupt_flag = False
 
         logger.info(f"PSF acquisition complete.")
 
     def preview_psf(self, conf):
-        self.start_control_stage(conf)
         self.cam.frame_dtype = conf["camera"]["dtype"]
-        self.cam.exposure_time = conf["psf"]["exposure_ms"] / 1000
-        _, _, ao_single, do_single, ft = get_full_waveforms(conf,ft=conf["psf"]["exposure_ms"]/1000)
+        self.cam.exposure_time = 1/conf["preview"]["fps"]
+
+        _, _, ao_single, do_single = get_full_waveforms(conf,fps = int(1/self.cam.exposure_time))
         self.cam.set_trigger(external=False, each_frame=True)
-        filter_fcn = lambda im: ((im - im.min()) * (255 / (im.max() - im.min()))).astype(im.dtype)
+        def filter_fcn(im):
+            im = cp.asarray(im)
+            return ((im - im.min()) * (255 / (im.max() - im.min()))).astype(im.dtype).get()
+        # filter_fcn = lambda im: ((im - im.min()) * (255 / (im.max() - im.min()))).astype(im.dtype)
 
         with self.dao.queue_data(ao_single, do_single, finite=True, chunked=False):
             self.cam.preview(filter_fcn=filter_fcn)
@@ -292,25 +299,44 @@ class LFM:
 
 
     def start_preview(self, conf):
-        #todo doesnt work :/
-        """Start a preview of camera frames."""
         self.cam.frame_dtype = conf["camera"]["dtype"]
-        preview_callback, imv = get_preview_callback(self.cam.frame_shape, refresh_every=2)
-        pg.Qt.QtWidgets.QApplication.processEvents(pg.Qt.QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 100)
-        interrupt = lambda: not imv.isVisible() or self.interrupt_flag
+        self.cam.exposure_time = 1 / conf["preview"]["fps"]
 
-        self.cam.exposure_time = 1/conf['camera']['preview_fps']
-        conf['camera']['preview_fps'] = int(1/self.cam.exposure_time)+1  # mismatch from when setting it
-        _, _, ao_single, do_single, ft = get_full_waveforms(conf, preview=True)
+        _, _, ao_single, do_single = get_full_waveforms(conf, fps=int(1 / self.cam.exposure_time))
+        self.cam.set_trigger(external=False, each_frame=True)
 
-        self.cam.set_trigger(external=True, each_frame=True)
-        self.cam.arm()
+        def filter_fcn(im):
+            im = cp.asarray(im)
+            return ((im - im.min()) * (255 / (im.max() - im.min()))).astype(im.dtype).get()
 
-        with self.dao.queue_data(ao_single, do_single, finite=False, chunked=False):
-            self.cam.stream(num_frames=int(1e9), callback=preview_callback, interrupt=interrupt, already_armed=True)
+        # filter_fcn = lambda im: ((im - im.min()) * (255 / (im.max() - im.min()))).astype(im.dtype)
+
+        with self.dao.queue_data(ao_single, do_single, finite=True, chunked=False):
+            self.cam.preview(filter_fcn=filter_fcn)
 
         self.point()
         logger.info(f"Preview stopped")
+
+
+        # doesnt work :/
+        # """Start a preview of camera frames."""
+        # self.cam.frame_dtype = conf["camera"]["dtype"]
+        # preview_callback, imv = get_preview_callback(self.cam.frame_shape, refresh_every=2)
+        # pg.Qt.QtWidgets.QApplication.processEvents(pg.Qt.QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 100)
+        # interrupt = lambda: not imv.isVisible() or self.interrupt_flag
+        #
+        # self.cam.exposure_time = 1/conf['camera']['preview_fps']
+        # conf['camera']['preview_fps'] = int(1/self.cam.exposure_time)+1  # mismatch from when setting it
+        # _, _, ao_single, do_single, ft = get_full_waveforms(conf, preview=True)
+        #
+        # self.cam.set_trigger(external=True, each_frame=True)
+        # self.cam.arm()
+        #
+        # with self.dao.queue_data(ao_single, do_single, finite=False, chunked=False):
+        #     self.cam.stream(num_frames=int(1e9), callback=preview_callback, interrupt=interrupt, already_armed=True)
+        #
+        # self.point()
+        # logger.info(f"Preview stopped")
 
 
     def acquire_timelapse(self, conf):
@@ -337,21 +363,23 @@ class LFM:
         # collect background frame
         logger.info('Acquiring background frame...')
         self.cam.frame_dtype = conf["camera"]["dtype"]
-        self.cam.exposure_time = 1/(conf["camera"]["recording_fps"]*1000)
+        self.cam.exposure_time = 1 / conf["acquisition"]["fps"]
+        fps = 1 / self.cam.exposure_time
+
         self.cam.set_trigger(external=False, each_frame=True) #internal trigger because were aquiring stack not streaming data?
-        bg_im = self.cam.acquire_stack(N_BACKGROUND_FRAMES)[0].mean(0, dtype='float32')
+        bg_im = self.cam.acquire_stack(int(5/self.cam.exposure_time))[0].mean(0, dtype='float32')
         with h5py.File(fn, 'w') as fh5:
             fh5.create_dataset("bg", data=bg_im)
 
         # setup camera acquisition
-        self.cam.exposure_time = 1 / conf['camera']['recording_fps']
+
         self.cam.set_trigger(external=True, each_frame=False)
-        conf["camera"]["recording_fps"] = 1/self.cam.exposure_time
+
 
         # create dataset
         logger.info('Set up image dataset...')
-        n_frames = conf['acquisition']['recording_seconds']*conf["camera"]["recording_fps"]
-        n_ramp_frames = conf['acquisition']['ramp_seconds']*conf["camera"]["recording_fps"]
+        n_frames = int(conf['acquisition']['recording_seconds']*fps)
+        n_ramp_frames = int(conf['acquisition']['ramp_seconds']*fps)
         stack_shape = (n_frames, *self.cam.frame_shape)
         stack_dtype = self.cam.frame_dtype
         if conf['acquisition']['compress']:
@@ -359,7 +387,7 @@ class LFM:
                                               name="data",
                                               dtype=stack_dtype,
                                               shape=stack_shape,
-                                              chunk_shape=(1, 1, *self.cam.frame_shape),
+                                              chunk_shape=(1, *self.cam.frame_shape),
                                               num_workers=8)
         else:
             writer = VanillaWriter(fn=fn,
@@ -402,7 +430,7 @@ class LFM:
 
         # setup DAQ
         conf["acquisition"]["ramp_seconds"] = 1 if conf["acquisition"]["ramp_seconds"] == 0 else conf["acquisition"]["ramp_seconds"],
-        ao_full, do_full, ao_single, do_single, ft = get_full_waveforms(conf)
+        ao_full, do_full, ao_single, do_single = get_full_waveforms(conf)
         stim_delay_sec = conf['acquisition']['ramp_s']
 
         # run (with statement manages DAO start and cleanup)
@@ -438,14 +466,26 @@ class LFM:
             logger.warning("Stage already active")
             return
         self.init_stage(conf, verbose=False)
-        self.stage_window = StageControlWindow()
+        self.stage_window = StageControlWindow(on_close=self.uninit_stage, conf=conf)
+
         # Example: connect button signals to LFM methods or lambdas
-        self.stage_window.ui.buttonforward.clicked.connect(lambda: self.stage.move_up())
-        self.stage_window.ui.buttonback.clicked.connect(lambda: self.stage.move_down())
-
-
-        self.stage_window.show()
-
+        def move_and_update(dx=0, dy=0, dz=0):
+            self.stage.move((dx, dy, dz), verbose=False)
+            pos = self.stage.get_position(verbose=False)
+            self.stage_window.ui.poslabel.setText(f"Position: x:{pos[0]:.4f}, y:{pos[1]:.5f}, z:{pos[2]:.5f}")
+        move_and_update()
+        self.stage_window.ui.buttonforward.clicked.connect(
+            lambda: move_and_update(dx=self.stage_window.ui.get_xmm()))
+        self.stage_window.ui.buttonback.clicked.connect(
+            lambda: move_and_update(dx=-self.stage_window.ui.get_xmm()))
+        self.stage_window.ui.buttonleft.clicked.connect(
+            lambda: move_and_update(dy=self.stage_window.ui.get_ymm()))
+        self.stage_window.ui.buttonright.clicked.connect(
+            lambda: move_and_update(dy=-self.stage_window.ui.get_ymm()))
+        self.stage_window.ui.buttonup.clicked.connect(
+            lambda: move_and_update(dz=self.stage_window.ui.get_zmm()))
+        self.stage_window.ui.buttondown.clicked.connect(
+            lambda: move_and_update(dz=-self.stage_window.ui.get_zmm()))
 
     def load_stimdata(self, p, filename, conf):
         """Load stimulus data from file.

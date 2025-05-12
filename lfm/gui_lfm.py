@@ -276,10 +276,12 @@ if __name__ == "__main__":
     # Add callback functions to buttons
     params_dict["acquisition"].update(
         dict(
-            preview=lambda d: button_callback("preview"),
             grab=lambda d: button_callback("grab"),
             # preview_test=lambda d: button_callback("preview_test"),
         )
+    )
+    params_dict["preview"].update(
+        preview=lambda d: button_callback("preview"),
     )
     params_dict["alignment"].update(
         dict(
@@ -288,7 +290,7 @@ if __name__ == "__main__":
             point=lambda d: button_callback("point"),
         )
     )
-    params_dict["hardware"].update(
+    params_dict["stage"].update(
         control_stage = lambda d: button_callback("control_stage"),
     )
     params_dict["psf"].update(

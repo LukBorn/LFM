@@ -9,10 +9,19 @@ acquisition:
   fps: 80
 preview:
   fps: 10
-  led_percent: 100
+  update_every: 5
+stage:
+  type: 'standa' #"sutter"
+  calibration: [.0025, .0025, .005]
+  overshoot: 0.001
+psf:
+  base_directory: 'D:\'
+  name_suffix: ''
+  z_layers: 120
+  z_distance_mm: 0.025
+  n_frames: 10
+  fps: 2
 camera:
-  recording_fps: 80
-  preview_fps: 10
   gain: 1
   cam_trig_width_ms: 0.05
   dtype: "uint8" #"uint16 and "uint8" supported
@@ -23,17 +32,6 @@ camera:
     x_decenter: 0
     y_bin: 1
     x_bin: 1 #=y_bin
-psf:
-  base_directory: 'D:\'
-  name_suffix: ''
-  z_layers: 120
-  z_distance_mm: 0.025
-  n_frames: 10
-  fps: 2
-stage:
-  type: 'standa' #"sutter"
-  calibration: [.0025, .0025, .005]
-  overshoot: 0.001
 daq:
   rate: 50000
   device: 'Dev1'

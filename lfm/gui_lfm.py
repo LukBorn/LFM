@@ -261,8 +261,6 @@ if __name__ == "__main__":
             lfm.point()
         elif name == "grab_psf":
             lfm.grab_psf(di.to_dict())
-        elif name == "preview_psf":
-            lfm.preview_psf(di.to_dict())
         elif name == "control_stage":
             lfm.start_control_stage(di.to_dict())
         else:
@@ -296,7 +294,6 @@ if __name__ == "__main__":
     params_dict["psf"].update(
         dict(
             grab_psf = lambda  d: button_callback("grab_psf"),
-            preview_psf = lambda d: button_callback("preview_psf"),
         )
     )
 

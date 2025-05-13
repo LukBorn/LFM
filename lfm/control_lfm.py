@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 
 from nidaqmx.utils import flatten_channel_string, unflatten_channel_string
 from ui.stage_controls import StageControlWindow
+from ui.preview import PreviewWindow
 
 from cams import DCamera as Camera
 from daq import unifiedDAO
@@ -193,15 +194,17 @@ class LFM:
         self.cam.frame_dtype = conf["camera"]["dtype"]
         self.cam.exposure_time = 1/conf["psf"]["fps"]
 
-        # collect background frame
-        logger.info('Acquiring background frame...')
-        self.cam.set_trigger(external=False)  # internal trigger because were aquiring stack not streaming data?
-        bg_im = self.cam.acquire_stack(int(5/self.cam.exposure_time))[0].mean(0, dtype='float32') #five seconds
-
         self.init_stage(conf,verbose=False)
         original_pos = self.stage.get_position(verbose=True)
 
         _, _, ao_single, do_single = get_full_waveforms(conf,fps = int(1/self.cam.exposure_time))
+
+        # collect background frame
+        logger.info('Acquiring background frame...')
+        self.cam.set_trigger(external=False)  # internal trigger because were aquiring stack not streaming data?
+        bg_im = self.cam.acquire_stack(int(5/self.cam.exposure_time))[0].mean(0, dtype='float32') #five seconds
+        preview_window = PreviewWindow()
+        preview_window.update(bg_im)  # Update the GUI
 
         self.cam.set_trigger(external=True, each_frame=False)
         logger.info(f"Exposure time: {self.cam.exposure_time*1000}ms")
@@ -223,41 +226,19 @@ class LFM:
                 fh5.create_dataset("psf", data = np.zeros(shape=(conf["psf"]["z_layers"], self.cam.frame_shape[0], self.cam.frame_shape[1])))
                 fh5.create_dataset("z_positions", data = np.zeros(shape=(conf["psf"]["z_layers"])))
 
-        # Create a main window with layout
-        main_window = pg.Qt.QtWidgets.QWidget()
-        layout = pg.Qt.QtWidgets.QVBoxLayout()
-        main_window.setLayout(layout)
-        main_window.setWindowTitle("PSF Preview with Z Position")
-        main_window.resize(900, 950)  # Adjust dimensions for both image and label
-        main_window.show()
-
-        # Create the ImageView and add it to the layout
-        imv = pg.ImageView()
-        imv.ui.menuBtn.hide()  # Hide unnecessary buttons
-        imv.ui.roiBtn.hide()
-        layout.addWidget(imv)  # Add ImageView to the layout
-        imv.setImage(bg_im, levels=(0, 255), autoHistogramRange=False)
-        pg.Qt.QtWidgets.QApplication.processEvents()
-
-        # Add a QLabel for displaying the relative Z position
-        z_label = pg.Qt.QtWidgets.QLabel()
-        layout.addWidget(z_label)  # Add QLabel below the image
-
+        avg_frame = np.zeros(shape=(conf["psf"]["n_frames"], self.cam.frame_shape[0], self.cam.frame_shape[1]))
 
         with self.dao.queue_data(ao_single, do_single, finite=False, chunked=False):
             outer = tqdm(range(conf["psf"]["z_layers"]),f"Acquiring PSF of {conf["psf"]["z_layers"]} layers with distance {conf["psf"]["z_distance_mm"]}mm",position=0, leave=True)
             for z in range(conf["psf"]["z_layers"]): #tdqm(range(conf["psf"]["z_layers"]),f"Acquiring PSF of {conf["psf"]["z_layers"]}layers with distance {conf["psf"]["z_distance_mm"]}mm"):
+                avg_frame.fill(0)
                 z_pos = self.stage.get_position(verbose=False)[2]
-                z_label.setText(f"Relative Z Position: {original_pos[2] - z_pos:.3f} mm")
-                pg.Qt.QtWidgets.QApplication.processEvents()
-                avg_frame = np.zeros(shape=(conf["psf"]["n_frames"],self.cam.frame_shape[0], self.cam.frame_shape[1]))
                 for n in tqdm(range(conf["psf"]["n_frames"]), desc=f"Acquiring layer {z+1} of {conf["psf"]["z_layers"]} at zpos {z_pos:.5f}",position=0, leave=True):
-                    frame_data = self.cam.acquire_stack(1, verbose=False)[0]
-                    imv.setImage(frame_data.T, levels=(0, 255), autoHistogramRange=False)  # Update data
-                    pg.Qt.QtWidgets.QApplication.processEvents()  # Update the GUI
-                    avg_frame[n,:,:] = frame_data
+                    frame_data = self.cam.acquire_stack(1, verbose=False)[0][0]
+                    preview_window.update(frame_data)  # Update the GUI
+                    avg_frame[n] = frame_data
                     # Detect if the preview window has been closed
-                if not imv.isVisible():
+                if not preview_window.isVisible():
                     logger.warning(f"Acquisition interrupted after layer {z}.")
                     self.interrupt_flag = True
                     break
@@ -273,30 +254,9 @@ class LFM:
         self.point()
 
         if self.interrupt_flag:
-            # self.stage.move_to(original_pos, verbose=True)
-            # self.uninit_stage()
-            # self.point()
             self.interrupt_flag = False
 
         logger.info(f"PSF acquisition complete.")
-
-    def preview_psf(self, conf):
-        self.cam.frame_dtype = conf["camera"]["dtype"]
-        self.cam.exposure_time = 1/conf["preview"]["fps"]
-
-        _, _, ao_single, do_single = get_full_waveforms(conf,fps = int(1/self.cam.exposure_time))
-        self.cam.set_trigger(external=False, each_frame=True)
-        def filter_fcn(im):
-            im = cp.asarray(im)
-            return ((im - im.min()) * (255 / (im.max() - im.min()))).astype(im.dtype).get()
-        # filter_fcn = lambda im: ((im - im.min()) * (255 / (im.max() - im.min()))).astype(im.dtype)
-
-        with self.dao.queue_data(ao_single, do_single, finite=True, chunked=False):
-            self.cam.preview(filter_fcn=filter_fcn)
-
-        self.point()
-        logger.info(f"Preview stopped")
-
 
     def start_preview(self, conf):
         self.cam.frame_dtype = conf["camera"]["dtype"]
@@ -305,39 +265,20 @@ class LFM:
         _, _, ao_single, do_single = get_full_waveforms(conf, fps=int(1 / self.cam.exposure_time))
         self.cam.set_trigger(external=False, each_frame=True)
 
-        def filter_fcn(im):
-            im = cp.asarray(im)
-            return ((im - im.min()) * (255 / (im.max() - im.min()))).astype(im.dtype).get()
+        preview_window = PreviewWindow()
+        def callback(im, ii, timestamp, frame_number):
+            if ii % conf["preview"]["update_every"] == 0:
+                preview_window.update(im)
 
-        # filter_fcn = lambda im: ((im - im.min()) * (255 / (im.max() - im.min()))).astype(im.dtype)
+        def interrupt():
+            return not preview_window.isVisible()
 
         with self.dao.queue_data(ao_single, do_single, finite=True, chunked=False):
-            self.cam.preview(filter_fcn=filter_fcn)
+            self.cam.stream(int(1e9), callback=callback, interrupt=interrupt)
+
 
         self.point()
         logger.info(f"Preview stopped")
-
-
-        # doesnt work :/
-        # """Start a preview of camera frames."""
-        # self.cam.frame_dtype = conf["camera"]["dtype"]
-        # preview_callback, imv = get_preview_callback(self.cam.frame_shape, refresh_every=2)
-        # pg.Qt.QtWidgets.QApplication.processEvents(pg.Qt.QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 100)
-        # interrupt = lambda: not imv.isVisible() or self.interrupt_flag
-        #
-        # self.cam.exposure_time = 1/conf['camera']['preview_fps']
-        # conf['camera']['preview_fps'] = int(1/self.cam.exposure_time)+1  # mismatch from when setting it
-        # _, _, ao_single, do_single, ft = get_full_waveforms(conf, preview=True)
-        #
-        # self.cam.set_trigger(external=True, each_frame=True)
-        # self.cam.arm()
-        #
-        # with self.dao.queue_data(ao_single, do_single, finite=False, chunked=False):
-        #     self.cam.stream(num_frames=int(1e9), callback=preview_callback, interrupt=interrupt, already_armed=True)
-        #
-        # self.point()
-        # logger.info(f"Preview stopped")
-
 
     def acquire_timelapse(self, conf):
         """Acquire a timelapse.
@@ -359,7 +300,6 @@ class LFM:
         fn = os.path.join(p_target, "data.h5")
         #fh5 = h5py.File(fn, "w")
 
-
         # collect background frame
         logger.info('Acquiring background frame...')
         self.cam.frame_dtype = conf["camera"]["dtype"]
@@ -371,16 +311,22 @@ class LFM:
         with h5py.File(fn, 'w') as fh5:
             fh5.create_dataset("bg", data=bg_im)
 
-        # setup camera acquisition
+        # set up preview
+        preview_window = PreviewWindow()
+        preview_window.update(bg_im)
 
-        self.cam.set_trigger(external=True, each_frame=False)
-
+        # setup DAQ
+        conf["acquisition"]["ramp_seconds"] = 1 if conf["acquisition"]["ramp_seconds"] == 0 else \
+        conf["acquisition"]["ramp_seconds"]
+        ao_full, do_full, ao_single, do_single = get_full_waveforms(conf, fps=int(1 / self.cam.exposure_time))
+        stim_delay_sec = conf['acquisition']['ramp_seconds']
+        logger.info(f"waveforms gotten")
 
         # create dataset
         logger.info('Set up image dataset...')
-        n_frames = int(conf['acquisition']['recording_seconds']*fps)
-        n_ramp_frames = int(conf['acquisition']['ramp_seconds']*fps)
-        stack_shape = (n_frames, *self.cam.frame_shape)
+        n_frames = int(conf['acquisition']['recording_seconds']*fps)+1
+        n_ramp_frames = int(conf['acquisition']['ramp_seconds']*fps)+1
+        stack_shape = (n_frames+20, *self.cam.frame_shape)
         stack_dtype = self.cam.frame_dtype
         if conf['acquisition']['compress']:
             writer = ParallelCompressedWriter(fn=fn,
@@ -388,7 +334,8 @@ class LFM:
                                               dtype=stack_dtype,
                                               shape=stack_shape,
                                               chunk_shape=(1, *self.cam.frame_shape),
-                                              num_workers=8)
+                                              num_workers=8
+                                              )
         else:
             writer = VanillaWriter(fn=fn,
                                    name="data",
@@ -396,24 +343,24 @@ class LFM:
                                    shape=stack_shape)
         logger.info(f"Dataset with shape {stack_shape} and dtype {stack_dtype} created in {fn}")
 
-        # set up preview
-        preview_callback, imv = get_preview_callback(self.cam.frame_shape, 
-                                                     window_title='Acquisition preview',
-                                                     refresh_every=30)
-        pg.Qt.QtWidgets.QApplication.processEvents(pg.Qt.QtCore.QEventLoop.AllEvents, 100)
 
-        
+        def preview_callback(im, ii, timestamp, frame_number):
+            if ii % conf["preview"]["update_every"] == 0:
+                preview_window.update(im)
+
         def interrupt():
-            if not imv.isVisible():
+            if not preview_window.isVisible():
                 self.interrupt_flag = True
-            return self.interrupt_flag 
+            return self.interrupt_flag
 
+        logger.info("callbacks defined")
         # define callback function
-        tstmp = np.ones(n_frames, dtype=np.float64) * np.nan
-        nfrm = np.zeros(n_frames, dtype=np.int64) - 1
+        tstmp = np.ones(n_frames+20, dtype=np.float64) * np.nan
+        nfrm = np.zeros(n_frames+20, dtype=np.int64) - 1
+        logger.info("timestamp array defined")
 
         def callback(im, ii, timestamp, frame_number):
-            frame_number -= n_ramp_frames 
+            frame_number -= n_ramp_frames
             if frame_number == 0:
                 logger.info(f'Starting to save at frame {n_ramp_frames+1}')
             if frame_number >= 0:
@@ -426,12 +373,8 @@ class LFM:
             preview_callback(im, ii, timestamp, frame_number)
 
         #start camera aquisition
-        self.cam.arm()
-
-        # setup DAQ
-        conf["acquisition"]["ramp_seconds"] = 1 if conf["acquisition"]["ramp_seconds"] == 0 else conf["acquisition"]["ramp_seconds"],
-        ao_full, do_full, ao_single, do_single = get_full_waveforms(conf)
-        stim_delay_sec = conf['acquisition']['ramp_s']
+        self.cam.set_trigger(external=True, each_frame=False)
+        logger.info("Arming camera...")
 
         # run (with statement manages DAO start and cleanup)
         logger.info(f"Starting acquisition of {n_frames} frames after a ramp of {n_ramp_frames} ...")
@@ -440,17 +383,16 @@ class LFM:
             with self.dao.queue_data(ao_full, do_full, finite=True, chunked=True), writer:
                 self.cam.stream(num_frames=n_ramp_frames+n_frames,
                                 callback=callback, 
-                                already_armed=True, 
+                                already_armed=False,
                                 interrupt=interrupt)
         
         self.point()
-
-        imv.close()
 
         # stop camera
         self.cam.disarm()
 
         # save timestamps and frame numbers
+        logger.info("Saving timestamps and frame numbers...")
         with h5py.File(fn, "a") as fh5:
             fh5.create_dataset("n_frm", data=nfrm)
             fh5.create_dataset("tstmp", data=tstmp)
@@ -458,7 +400,9 @@ class LFM:
         if self.interrupt_flag:
             logger.warning(f"Acquisition interrupted after frame {nfrm.max()}.")
             self.interrupt_flag = False
+            preview_window.close()
         else:
+            preview_window.close()
             logger.info(f"Acquisition complete.")
             
     def start_control_stage(self, conf):
@@ -475,13 +419,13 @@ class LFM:
             self.stage_window.ui.poslabel.setText(f"Position: x:{pos[0]:.4f}, y:{pos[1]:.5f}, z:{pos[2]:.5f}")
         move_and_update()
         self.stage_window.ui.buttonforward.clicked.connect(
-            lambda: move_and_update(dx=self.stage_window.ui.get_xmm()))
+            lambda: move_and_update(dy=self.stage_window.ui.get_xmm()))
         self.stage_window.ui.buttonback.clicked.connect(
-            lambda: move_and_update(dx=-self.stage_window.ui.get_xmm()))
+            lambda: move_and_update(dy=-self.stage_window.ui.get_xmm()))
         self.stage_window.ui.buttonleft.clicked.connect(
-            lambda: move_and_update(dy=self.stage_window.ui.get_ymm()))
+            lambda: move_and_update(dx=-self.stage_window.ui.get_ymm()))
         self.stage_window.ui.buttonright.clicked.connect(
-            lambda: move_and_update(dy=-self.stage_window.ui.get_ymm()))
+            lambda: move_and_update(dx=self.stage_window.ui.get_ymm()))
         self.stage_window.ui.buttonup.clicked.connect(
             lambda: move_and_update(dz=self.stage_window.ui.get_zmm()))
         self.stage_window.ui.buttondown.clicked.connect(

@@ -9,6 +9,7 @@ acquisition:
   fps: 80
 preview:
   fps: 10
+  update_every: 5
 stage:
   type: 'standa' #"sutter"
   calibration: [.0025, .0025, .005]

@@ -616,8 +616,6 @@ class XimeaCamera(CameraBase):
     def close(self):
         pass
 
-
-
 from pyDCAM import dcamapi_init, HDCAM, DCAMIDPROP, DCAMPROPMODEVALUE, dcamapi_uninit
 class DCamera(CameraBase):
     '''Hamamatsu DCAM camera using pyDCAM
@@ -736,7 +734,7 @@ class DCamera(CameraBase):
         if self._fifo and self._last_frame is not None and frame_count - self._last_frame > 1:
             logger.warning(f'{frame_count - self._last_frame - 1} frames dropped')
         self._last_frame = frame_count
-        return frame_data, time.time(), frame_index
+        return frame_data, time.time(), frame_count
 
     @property
     def frame_dtype(self):

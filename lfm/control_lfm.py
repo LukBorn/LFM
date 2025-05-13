@@ -267,7 +267,8 @@ class LFM:
 
         preview_window = PreviewWindow()
         def callback(im, ii, timestamp, frame_number):
-           preview_window.update(im)
+            if ii % conf["preview"]["update_every"] == 0:
+                preview_window.update(im)
 
         def interrupt():
             return not preview_window.isVisible()
@@ -310,6 +311,10 @@ class LFM:
         with h5py.File(fn, 'w') as fh5:
             fh5.create_dataset("bg", data=bg_im)
 
+        # set up preview
+        preview_window = PreviewWindow()
+        preview_window.update(bg_im)
+
         # setup DAQ
         conf["acquisition"]["ramp_seconds"] = 1 if conf["acquisition"]["ramp_seconds"] == 0 else \
         conf["acquisition"]["ramp_seconds"]
@@ -319,9 +324,9 @@ class LFM:
 
         # create dataset
         logger.info('Set up image dataset...')
-        n_frames = int(conf['acquisition']['recording_seconds']*fps)
-        n_ramp_frames = int(conf['acquisition']['ramp_seconds']*fps)
-        stack_shape = (n_frames, *self.cam.frame_shape)
+        n_frames = int(conf['acquisition']['recording_seconds']*fps)+1
+        n_ramp_frames = int(conf['acquisition']['ramp_seconds']*fps)+1
+        stack_shape = (n_frames+20, *self.cam.frame_shape)
         stack_dtype = self.cam.frame_dtype
         if conf['acquisition']['compress']:
             writer = ParallelCompressedWriter(fn=fn,
@@ -338,25 +343,24 @@ class LFM:
                                    shape=stack_shape)
         logger.info(f"Dataset with shape {stack_shape} and dtype {stack_dtype} created in {fn}")
 
-        # set up preview
-        preview_window = PreviewWindow()
-        preview_window.update(bg_im)
+
         def preview_callback(im, ii, timestamp, frame_number):
-            if ii % 5 == 0:
+            if ii % conf["preview"]["update_every"] == 0:
                 preview_window.update(im)
 
         def interrupt():
-            self.interrupt_flag = True
-            return not preview_window.isVisible()
+            if not preview_window.isVisible():
+                self.interrupt_flag = True
+            return self.interrupt_flag
 
         logger.info("callbacks defined")
         # define callback function
-        tstmp = np.ones(n_frames, dtype=np.float64) * np.nan
-        nfrm = np.zeros(n_frames, dtype=np.int64) - 1
+        tstmp = np.ones(n_frames+20, dtype=np.float64) * np.nan
+        nfrm = np.zeros(n_frames+20, dtype=np.int64) - 1
         logger.info("timestamp array defined")
 
         def callback(im, ii, timestamp, frame_number):
-            frame_number -= n_ramp_frames 
+            frame_number -= n_ramp_frames
             if frame_number == 0:
                 logger.info(f'Starting to save at frame {n_ramp_frames+1}')
             if frame_number >= 0:
@@ -388,6 +392,7 @@ class LFM:
         self.cam.disarm()
 
         # save timestamps and frame numbers
+        logger.info("Saving timestamps and frame numbers...")
         with h5py.File(fn, "a") as fh5:
             fh5.create_dataset("n_frm", data=nfrm)
             fh5.create_dataset("tstmp", data=tstmp)

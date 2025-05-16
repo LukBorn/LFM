@@ -1,0 +1,2 @@
+C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+-ExecutionPolicy ByPass -NoExit -Command "& 'C:\Users\jlab\miniforge3\shell\condabin\conda-hook.ps1' ; conda activate lfm1 ; python C:/Users/jlab/Repos/lfm/lfm/gui_lfm.py --config gui_lfm_defaults.yml"

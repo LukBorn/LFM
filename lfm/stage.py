@@ -4,7 +4,7 @@ import time
 import libximc.highlevel as ximc
 import numpy as np
 
-from opm_acquire.stage import sutterMP285
+from stage_old import sutterMP285
 class SutterStage:
     def __init__(self, verbose=False, overshoot=0.001,com = "COM4"):
         self.stage = sutterMP285(com)

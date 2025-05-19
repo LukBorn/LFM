@@ -1,12 +1,52 @@
 import numpy as np
 import cupy as cp
 from tqdm.auto import tqdm
-from lfm.util import create_projection_image
+from util import create_projection_image
 import h5py
 import os
 from multiprocessing import Pool, cpu_count
 from functools import partial
 import tempfile
+from daio.h5 import lazyh5
+import os
+import glob
+
+class Paths():
+    def __init__(pn_rec=None,
+                 pn_psf=None,
+                 pn_out=None,
+                 pn_scratch=None,
+                 base_dir=None):
+        ...
+    def get_recording(pn_rec):
+        ...
+    def get_psf(pn_psf):
+        ...
+                 
+                 
+
+def reconstruct_vols_from_img(paths,
+                              xy_pad=201,
+                              roi_size=300,
+                              max_iter=30,
+                              loss_threshold = 0,
+                              gpu=True,
+                              verbose=True,
+                             ):
+    if gpu:
+        import cupy as xp
+        from cupy.fft import fft2, ifft2, ifftshift
+    else:
+        import numpy as xp
+        from scipy.fft import fft2, ifft2, ifftshift
+
+    print("Loading PSF, Calculating OTF") if verbose else None
+    psf = lazyh5(paths.psf)
+    size_z = psf["psf"].shape[0]
+    size_y = psf["psf"].shape[1] + 2 * xy_pad
+    size_x = psf["psf"].shape[2] + 2 * xy_pad
+    
+    otf = xp.memmap
 
 
 def reconstruct_vols_from_img_parallel(imgs_path,
@@ -39,6 +79,7 @@ def reconstruct_vols_from_img_parallel(imgs_path,
         import numpy as xp
         from scipy.fft import fft2, ifft2, ifftshift
 
+    
     def reconstruct_single_img(img,
                                obj_0
                                ):

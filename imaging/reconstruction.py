@@ -47,8 +47,10 @@ class Paths():
         self.out_url = self.pn_outrec.replace(expand('~'), url_home)         
 
 def reconstruct_vols_from_img(paths,
-                              OTF_settings=dict(subtract_bg=True,
-                                                normalize=True,),
+                              OTF_subtract_bg=True,
+                              OTF_normalize=True,
+                              img_subtract_bg=True,
+                              img_mask=True
                               xy_pad=201,
                               roi_size=300,
                               max_iter=30,
@@ -74,26 +76,31 @@ def reconstruct_vols_from_img(paths,
     bg = xp.array(psf["bg"])
     for z in range(size_z):
         slice_processed = psf["psf"][z,:,:]
-        if OTF_settings["subtract_bg"]:
+        if OTF_subtract_bg:
             slice_processed -= bg 
-        if OTF_settings["normalize"]:
+        if OTF_normalize:
             slice_processed /= slice_processed.sum()
         OTF[z, :, :] = fft2(ifftshift(xp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')))
-    del bg
 
     print("Loading Images") if verbose else None
     data = lazyh5(paths.raw)
     n_img = data["data"].shape[0]
-
-
-    prev_vol = xp.ones((size_z, 2 * roi_size, 2 * roi_size), dtype=xp.float32)
     
     with h5py.File(paths.deconvolved, 'w') as f:
         # Create dataset for the reconstructed volume
-        print("Creating dataset") if verbose else None    
+        print("Creating output dataset") if verbose else None    
         dset = f.create_dataset("data", shape=(n_img, size_z, 2*roi_size, 2*roi_size), dtype=np.float32)        
         losses = f.create_dataset("losses", shape=(n_img,), dtype=np.float32)
         n_iters = f.create_dataset("n_iters", shape=(n_img,), dtype=np.int32)
+        grp = f.create_group("deconvolution_params")
+        grp.attr["roi_size"] = roi_size
+        grp.attr["xy_pad"] = xy_pad
+        grp.attr["max_iter"] = max_iter
+        grp.attr["loss_threshold"] = loss_threshold
+        grp.attr["OTF_subtract_bg"] = OTF_subtract_bg
+        grp.attr["OTF_normalize"] = OTF_normalize
+        grp.attr["img_subtract_bg"] = img_subtract_bg
+        grp.attr["img_mask"] = img_mask
 
         #create multithreaded IO
         result_queue = queue.Queue(maxsize=5)
@@ -109,19 +116,45 @@ def reconstruct_vols_from_img(paths,
 
         io_thread = threading.Thread(target=io_worker, args=(dset,))
         io_thread.start()
+
+        print("initializing memory") if verbose else None
+        # Preallocate memory for the reconstructed volume
+        obj_recon = xp.ones((size_z, 2 * roi_size, 2 * roi_size), dtype=xp.float32)
+        temp_obj = xp.zeros((size_y, size_x), dtype=xp.float32)
+        img_est = xp.zeros((size_y, size_x), dtype=xp.float32)
+        ratio_img = xp.zeros((size_y, size_x), dtype=xp.float32)
+        prev_vol = obj_recon.copy()
+
         for it in tqdm(range(n_img), desc="Reconstructing volumes:"):
-            img = data["data"][it, :, :]
-            # Reconstruct volume
-            obj_recon, loss, n_iter = reconstruct_single_img(img,
-                                                prev_vol,
-                                                OTF,
-                                                size_y,
-                                                size_x,
-                                                size_z,
-                                                xy_pad,
-                                                roi_size,
-                                                max_iter,
-                                                loss_threshold)
+            img = xp.array(data["data"][it, :, :])
+            if img_subtract_bg:
+                img -= bg
+            if img_mask:
+                img = img * psf["circle_mask"]
+            img_padded = xp.pad(img, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')
+            obj_recon  = prev_vol.copy()
+
+            for it in tqdm(range(max_iter), leave=False):
+                img_est.fill(0)
+
+                for z in range(size_z):
+                    temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size,
+                             size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
+                    img_est += xp.maximum(xp.real(ifft2(OTF[z, :, :] * fft2(temp_obj))), 0)
+
+                ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad] = img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] / (
+                        img_est[xy_pad:-xy_pad, xy_pad:-xy_pad] + xp.finfo(xp.float32).eps)
+
+                for z in range(size_z):
+                    temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size,
+                             size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
+                    temp = temp_obj * (xp.maximum(xp.real(ifft2(fft2(ratio_img) * xp.conj(OTF[z, :, :]))), 0))
+                    obj_recon[z, :, :] = temp[size_y // 2 - roi_size: size_y // 2 + roi_size,
+                                              size_x // 2 - roi_size: size_x // 2 + roi_size]
+                calc_loss = xp.mean(xp.abs(xp.log(ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad])))
+                if calc_loss < loss_threshold:
+                    break
+ 
             # Save volume
             result_queue.put((it, obj_recon.get() if gpu else obj_recon))
             # Save loss and n_iter

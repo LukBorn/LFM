@@ -47,15 +47,16 @@ class Paths():
         self.out_url = self.pn_outrec.replace(expand('~'), url_home)         
 
 def reconstruct_vols_from_img(paths,
-                              OTF_subtract_bg=True,
-                              OTF_normalize=True,
-                              img_subtract_bg=True,
-                              img_mask=True
                               xy_pad=201,
                               roi_size=300,
                               max_iter=30,
                               loss_threshold = 0,
+                              OTF_subtract_bg=True,
+                              OTF_normalize=True,
+                              img_subtract_bg=True,
+                              img_mask=True,
                               gpu=True,
+                              max_io_threads=5,
                               verbose=True,
                              ):
     if gpu:
@@ -103,7 +104,7 @@ def reconstruct_vols_from_img(paths,
         grp.attr["img_mask"] = img_mask
 
         #create multithreaded IO
-        result_queue = queue.Queue(maxsize=5)
+        result_queue = queue.Queue(maxsize=max_io_threads)
         def io_worker(dset):
             while True:
                 item = result_queue.get()
@@ -121,9 +122,9 @@ def reconstruct_vols_from_img(paths,
         # Preallocate memory for the reconstructed volume
         obj_recon = xp.ones((size_z, 2 * roi_size, 2 * roi_size), dtype=xp.float32)
         temp_obj = xp.zeros((size_y, size_x), dtype=xp.float32)
+        im_padded = xp.zeros((size_y, size_x), dtype=xp.float32)        
         img_est = xp.zeros((size_y, size_x), dtype=xp.float32)
         ratio_img = xp.zeros((size_y, size_x), dtype=xp.float32)
-        prev_vol = obj_recon.copy()
 
         for it in tqdm(range(n_img), desc="Reconstructing volumes:"):
             img = xp.array(data["data"][it, :, :])
@@ -131,28 +132,29 @@ def reconstruct_vols_from_img(paths,
                 img -= bg
             if img_mask:
                 img = img * psf["circle_mask"]
-            img_padded = xp.pad(img, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')
-            obj_recon  = prev_vol.copy()
+            img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
 
-            for it in tqdm(range(max_iter), leave=False):
+            for n_iter in tqdm(range(max_iter), leave=False):
                 img_est.fill(0)
-
+                #forward pass
                 for z in range(size_z):
+                    # reusing obj_recon from previous iteration bc they are probably very similar
                     temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size,
                              size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
                     img_est += xp.maximum(xp.real(ifft2(OTF[z, :, :] * fft2(temp_obj))), 0)
-
+                #calculate ratio
                 ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad] = img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] / (
                         img_est[xy_pad:-xy_pad, xy_pad:-xy_pad] + xp.finfo(xp.float32).eps)
-
+                #backward pass
                 for z in range(size_z):
                     temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size,
                              size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
                     temp = temp_obj * (xp.maximum(xp.real(ifft2(fft2(ratio_img) * xp.conj(OTF[z, :, :]))), 0))
                     obj_recon[z, :, :] = temp[size_y // 2 - roi_size: size_y // 2 + roi_size,
                                               size_x // 2 - roi_size: size_x // 2 + roi_size]
-                calc_loss = xp.mean(xp.abs(xp.log(ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad])))
-                if calc_loss < loss_threshold:
+                #calculate loss
+                loss = xp.mean(xp.abs(xp.log(ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad])))
+                if loss < loss_threshold:
                     break
  
             # Save volume
@@ -160,7 +162,7 @@ def reconstruct_vols_from_img(paths,
             # Save loss and n_iter
             losses[it] = loss
             n_iters[it] = n_iter
-            prev_vol = obj_recon
+
     # Stop the IO thread
     result_queue.put(None)
     io_thread.join()

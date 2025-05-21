@@ -13,8 +13,9 @@ import threading, queue
 class Paths():
     def __init__(self, 
                 dataset_name, 
+                psf_name,
                 pn_rec='',
-                pn_psf='', 
+                pn_psfs='', 
                 pn_out='', 
                 pn_scratch='', 
                 url_home='', verbosity=0, expand=True, create_dirs=True):
@@ -28,8 +29,9 @@ class Paths():
         self.pn_rec = expand(pathlib.Path(pn_rec, dataset_name))
         self.pn_out = expand(pathlib.Path(pn_out))
         self.pn_outrec = expand(pathlib.Path(self.pn_out, dataset_name))
-        self.pn_scratch = expand(pathlib.Path(scratch,dataset_name))
-        self.pn_psf = expand(pathlib.Path(pn_psf))
+        self.pn_scratch = expand(pathlib.Path(scratch, dataset_name))
+        self.pn_psfs = expand(pathlib.Path(pn_psfs))
+        self.pn_psf = expand(pathlib.Path(self.pn_psfs, psf_name))
         
         # create directories
         if create_dirs:
@@ -71,21 +73,24 @@ def reconstruct_vols_from_img(paths,
     size_z = psf["psf"].shape[0]
     size_y = psf["psf"].shape[1] + 2 * xy_pad
     size_x = psf["psf"].shape[2] + 2 * xy_pad
-    
+    crop = xp.array(psf["crop"])
     #calculate OTF
     OTF = xp.zeros((size_z, size_y, size_x), dtype=xp.complex64)
-    bg = xp.array(psf["bg"])
+    bg = xp.array(psf["bg"]).astype(xp.float32)
     for z in range(size_z):
-        slice_processed = psf["psf"][z,:,:]
+        slice_processed = xp.asarray(psf["psf"][z,:,:]).astype(xp.float32)
         if OTF_subtract_bg:
-            slice_processed -= bg 
+            slice_processed -= bg
         if OTF_normalize:
             slice_processed /= slice_processed.sum()
         OTF[z, :, :] = fft2(ifftshift(xp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')))
+        # assert slice_processed.sum() = 1, "OTF not normalized"
 
     print("Loading Images") if verbose else None
     data = lazyh5(paths.raw)
     n_img = data["data"].shape[0]
+    if img_mask:
+        mask = psf["circle_mask"][crop[0]:crop[1], crop[2]:crop[3]]
     
     with h5py.File(paths.deconvolved, 'w') as f:
         # Create dataset for the reconstructed volume
@@ -127,11 +132,11 @@ def reconstruct_vols_from_img(paths,
         ratio_img = xp.zeros((size_y, size_x), dtype=xp.float32)
 
         for it in tqdm(range(n_img), desc="Reconstructing volumes:"):
-            img = xp.array(data["data"][it, :, :])
+            img = xp.array(data["data"][it, crop[0]:crop[1]], crop[2]:crop[3]]).astype(xp.float32)
             if img_subtract_bg:
                 img -= bg
             if img_mask:
-                img = img * psf["circle_mask"]
+                img = img * mask
             img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
 
             for n_iter in tqdm(range(max_iter), leave=False):

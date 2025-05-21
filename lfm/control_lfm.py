@@ -202,7 +202,7 @@ class LFM:
         # collect background frame
         logger.info('Acquiring background frame...')
         self.cam.set_trigger(external=False)  # internal trigger because were aquiring stack not streaming data?
-        bg_im = self.cam.acquire_stack(int(5/self.cam.exposure_time))[0].mean(0, dtype='float32') #five seconds
+        bg_im = self.cam.acquire_stack(int(5/self.cam.exposure_time))[0].mean(0, dtype=self.cam.frame_dtype) #five seconds
         preview_window = PreviewWindow()
         preview_window.update(bg_im)  # Update the GUI
 
@@ -222,11 +222,14 @@ class LFM:
             fn = os.path.join(p_target, "psf.h5")
             logger.info(f"Saving PSF to {fn}")
             with h5py.File(fn, 'w') as fh5:
-                fh5.create_dataset("bg", data = bg_im)
-                fh5.create_dataset("psf", data = np.zeros(shape=(conf["psf"]["z_layers"], self.cam.frame_shape[0], self.cam.frame_shape[1])))
+                fh5.create_dataset("bg", data = bg_im, dtype=self.cam.frame_dtype)
+                fh5.create_dataset("psf", data = np.zeros(shape=(conf["psf"]["z_layers"],
+                                                                  self.cam.frame_shape[0], 
+                                                                  self.cam.frame_shape[1])),
+                                          dtype=self.cam.frame_dtype)
                 fh5.create_dataset("z_positions", data = np.zeros(shape=(conf["psf"]["z_layers"])))
 
-        avg_frame = np.zeros(shape=(conf["psf"]["n_frames"], self.cam.frame_shape[0], self.cam.frame_shape[1]))
+        avg_frame = np.zeros(shape=(conf["psf"]["n_frames"], self.cam.frame_shape[0], self.cam.frame_shape[1]), dtype = self.cam.frame_dtype)
 
         with self.dao.queue_data(ao_single, do_single, finite=False, chunked=False):
             outer = tqdm(range(conf["psf"]["z_layers"]),f"Acquiring PSF of {conf["psf"]["z_layers"]} layers with distance {conf["psf"]["z_distance_mm"]}mm",position=0, leave=True)
@@ -244,7 +247,7 @@ class LFM:
                     break
                 if conf["psf"]["name_suffix"].strip() != "":
                     with h5py.File(fn, 'a') as fh5:
-                        fh5["psf"][z, :, :] = avg_frame.mean(axis=0)
+                        fh5["psf"][z, :, :] = avg_frame.mean(axis=0, dtype = self.cam.frame_dtype)
                         fh5["z_positions"][z] = z_pos
 
                 self.stage.move((0, 0, -conf["psf"]["z_distance_mm"]))
@@ -307,9 +310,9 @@ class LFM:
         fps = 1 / self.cam.exposure_time
 
         self.cam.set_trigger(external=False, each_frame=True) #internal trigger because were aquiring stack not streaming data?
-        bg_im = self.cam.acquire_stack(int(5/self.cam.exposure_time))[0].mean(0, dtype='float32')
+        bg_im = self.cam.acquire_stack(int(5/self.cam.exposure_time))[0].mean(0, dtype = self.cam.frame_dtype)
         with h5py.File(fn, 'w') as fh5:
-            fh5.create_dataset("bg", data=bg_im)
+            fh5.create_dataset("bg", data=bg_im, dtype = self.cam.frame_dtype)
 
         # set up preview
         preview_window = PreviewWindow()

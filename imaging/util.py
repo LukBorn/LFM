@@ -115,35 +115,6 @@ def create_projection_image(volume, projection_func=None, pad=10):
     return output
 
 
-def save_video(fn,ims,fps):
-    """Save video from list of images
-
-    Args:
-        fn (str): filename of videofile
-        ims (list of grayscale images): video data
-        fps (float): video framerate, frames per second
-    """
-    print(f"Saving video...\n{fn}")
-    container = av.open(fn, mode="w")
-    stream = container.add_stream("h264", rate=fps) # h264_nvenc
-    stream.height, stream.width = ims[0].shape
-    stream.pix_fmt = "yuv420p"
-    # stream.options = {"tune": 'hq', 'preset': '7', 'rc': 'vbr', 'cq': '20', 'b':'0', 'profile': 'high'} #h264_nvenc
-    stream.options = {'qmax': str(25), 'qmin': str(25)}  # h264
-
-    for im in ims:
-        if im.ndim == 2:
-            im_rgb = np.stack([im]*3, axis=-1)
-        else:
-            im_rgb = im
-        frame = av.VideoFrame.from_ndarray(im, format="gray")
-        for packet in stream.encode(frame):
-            container.mux(packet)
-    for packet in stream.encode():
-        container.mux(packet)
-    container.close()
-    print(f"Done.")
-
 def generate_random_gaussians_3d(shape,
                                  sparseness=0.01,  # fraction of voxels that contain Gaussians
                                  intensity_dist=(50, 200),  # (min, max) for uniform distribution

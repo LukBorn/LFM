@@ -264,10 +264,6 @@ def reconstruct_vols_from_imgs_parallel(paths,
 
 
 
-
-
-
-
 def reconstruct_vols_from_imgs(paths,
                                img_idx=None,
                                params= dict(max_iter=30,
@@ -442,21 +438,23 @@ def reconstruct_vol_from_img(img,
                              bg=None,
                              circle_mask=None,
                              otf_path="",
-                             params=dict(max_iter=30,
-                                         xy_pad=201,
-                                         roi_size=300,
-                                         loss_threshold = 0,
-                                         psf_downsample=1,
-                                         OTF_subtract_bg=True,
-                                         OTF_normalize=True,
-                                         img_subtract_bg=False,
-                                         img_mask=True,),
+                             max_iter=30,
+                            xy_pad=201,
+                            roi_size=300,
+                            loss_threshold = 0,
+                            psf_downsample=1,
+                            OTF_subtract_bg=True,
+                            OTF_normalize=True,
+                            OTF_clip=False,
+                            img_subtract_bg=False,
+                            img_mask=True,
+                            img_clip=True,
                              verbose=True,
                              plot=False,
                              pad=10,
                              ):
 
-    max_iter, xy_pad, roi_size, loss_threshold, psf_downsample, OTF_subtract_bg, OTF_normalize, img_subtract_bg, img_mask = params.values()
+
     
     
 
@@ -474,13 +472,15 @@ def reconstruct_vol_from_img(img,
 
         OTF = cp.zeros((size_z, size_y, size_x), dtype=cp.complex64)
 
-        for z in range(0,size_z,psf_downsample):
+        for i,z in enumerate(tqdm(range(0,psf.shape[0],psf_downsample))):
             slice_processed = cp.asarray(psf[z,:,:]).astype(cp.float32)
             if OTF_subtract_bg:
                 slice_processed -= bg
+            if OTF_clip:
+                slice_processed = cp.clip(slice_processed, 0, None)
             if OTF_normalize:
                 slice_processed /= slice_processed.sum()
-            OTF[z, :, :] = fft2(ifftshift(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')))
+            OTF[i, :, :] = fft2(ifftshift(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')))
             # OTF[z, :, :] = fft2(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant'))
         if len(otf_path)>0:
             cp.save(otf_path, OTF)
@@ -490,6 +490,8 @@ def reconstruct_vol_from_img(img,
     if img_subtract_bg:
         assert bg is not None, "bg must be provided if img_subtract_bg is True"
         img -= bg
+    if img_clip:
+        img = cp.clip(img, 0, None)
     if img_mask:
         assert circle_mask is not None, "circle_mask must be provided if img_mask is True"
         img *= circle_mask
@@ -531,4 +533,120 @@ def reconstruct_vol_from_img(img,
     return obj_recon, plot_mip, losses
 
 
+def reconstruct_vol_from_img1(img,
+                             psf=None,
+                             obj_0=None,
+                             bg=None,
+                             circle_mask=None,
+                             otf_path="",
+                             max_iter=30,
+                             xy_pad=201,
+                             roi_size=300,
+                             loss_threshold = 0,
+                             psf_downsample=1,
+                             OTF_subtract_bg=True,
+                             OTF_normalize=True,
+                             OTF_clip=False,
+                             img_subtract_bg=False,
+                             img_mask=True,
+                             img_clip=True,
+                             verbose=True,
+                             plot=False,
+                             pad=10,
+                             ):
 
+    
+    
+
+    if psf is None and len(otf_path)==0:
+        raise ValueError("No PSF or OTF provided")
+    elif psf is None and len(otf_path)>0:
+        print("Loading OTF from disk") if verbose else None
+        OTF = cp.load(otf_path) 
+        size_z, size_y, size_x  = OTF.shape
+    else:
+        print("Calculating OTF") if verbose else None
+        size_y = psf.shape[1] + 2 * xy_pad
+        size_x = psf.shape[2] + 2 * xy_pad
+        size_z = int(psf.shape[0]/psf_downsample)
+
+        # print(f"PSF zspacing: {np.abs(np.diff(psf["z_positions"][::psf_downsample])).mean()*1000} um") if verbose else None	
+        psf = cp.asarray(psf[::psf_downsample,:,:]).astype(cp.float32)
+        if OTF_subtract_bg:
+            assert bg is not None, "bg must be provided if OTF_subtract_bg is True"
+            psf -= bg 
+        if OTF_clip:
+            psf = cp.clip(psf, 0, None)
+        if OTF_normalize:
+            assert psf is not None, "psf must be provided if OTF_normalize is True"
+            psf /= psf.sum(axis=(1, 2), keepdims=True)
+        
+        psf = cp.pad(psf, ((0, 0), (xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')
+        OTF = fft2(ifftshift(psf, axes=(1,2)), axes=(1,2))
+
+        # psf = cp.asarray(psf).astype(cp.float32)
+        # OTF = cp.zeros((size_z, size_y, size_x), dtype=cp.complex64)
+        # for z in range(0,size_z,psf_downsample):
+        #     slice_processed = cp.asarray(psf[z,:,:]).astype(cp.float32)
+        #     if OTF_subtract_bg:
+        #         slice_processed -= bg
+        #     if OTF_clip:
+        #         slice_processed = cp.clip(slice_processed, 0, None)
+        #     if OTF_normalize:
+        #         slice_processed /= slice_processed.sum()
+        #     OTF[z, :, :] = fft2(ifftshift(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')))
+        # if len(otf_path)>0:
+        #     cp.save(otf_path, OTF)
+
+
+    print("Initializing memory") if verbose else None
+    if img_subtract_bg:
+        assert bg is not None, "bg must be provided if img_subtract_bg is True"
+        img -= bg
+    if img_clip:
+        img = cp.clip(img, 0, None)
+    if img_mask:
+        assert circle_mask is not None, "circle_mask must be provided if img_mask is True"
+        img *= circle_mask
+    img_padded = cp.pad(img, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')
+
+    obj_recon = obj_0 if obj_0 is not None else cp.ones((size_z, 2 * roi_size, 2 * roi_size), dtype=cp.float32)
+    losses = cp.zeros(max_iter, dtype=cp.float32)
+    plot_mip = cp.zeros(shape=(max_iter, 2*roi_size + size_z + 3 * pad, 2*roi_size + size_z + 3 * pad), dtype=cp.float32) if plot else None
+    #temp_obj = cp.zeros((size_z, size_y, size_x), dtype=cp.float32)
+    temp_obj = cp.zeros((size_y, size_x), dtype=cp.float32)
+    ratio_img = cp.zeros((size_y, size_x), dtype=cp.float32)
+    img_est = cp.zeros((size_y, size_x), dtype=cp.float32)
+
+    for it in tqdm(range(max_iter)):
+        img_est.fill(0)
+        # temp_obj.fill(0)
+
+        # temp_obj[:,size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[:, :, :]
+        # img_est = cp.clip(cp.real(ifft2(OTF * fft2(temp_obj), axes=(1,2)), axes=(1,2)), 0, None).sum(axis=0)
+
+        for z in range(size_z):
+            temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
+            img_est += cp.maximum(cp.real(ifft2(OTF[z, :, :] * fft2(temp_obj))), 0)
+        ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad] = img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] / (
+                    img_est[xy_pad:-xy_pad, xy_pad:-xy_pad] + cp.finfo(cp.float32).eps)
+        # temp_obj[:,size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[:, :, :]
+        # temp_obj *= cp.clip(cp.real(ifft2(fft2(ratio_img) * cp.conj(OTF), axes=(1,2))), 0, None)
+        # obj_recon[:, :, :] = temp_obj[:, size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size]
+        for z in range(size_z):
+            temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
+            temp = temp_obj * (cp.maximum(cp.real(ifft2(fft2(ratio_img) * cp.conj(OTF[z, :, :]))), 0))
+            obj_recon[z, :, :] = temp[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size]
+
+        if plot:
+            plot_mip[it,:,:] = create_projection_image(obj_recon,cp.max,pad)
+
+        ratio_ = ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad]
+        calc_loss = cp.mean(cp.abs(cp.log(ratio_[ratio_>0])))
+        losses[it] = calc_loss
+        if calc_loss < loss_threshold:
+            losses = losses[:it]
+            plot_mip = plot_mip[:it]
+            break
+
+    return obj_recon, plot_mip, losses

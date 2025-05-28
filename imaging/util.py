@@ -39,7 +39,11 @@ def array_to_video(array_3d, filename=None, fps=10, cmap='viridis', title=None, 
     from IPython.display import HTML
 
     fig, ax = plt.subplots(figsize=(8, 8))
-    img = ax.imshow(array_3d[0], cmap=cmap, vmin=0, vmax=array_3d.max())
+    if vmin is None:
+        vmin = 0
+    if vmax is None:
+        vmax = array_3d.max()
+    img = ax.imshow(array_3d[0], cmap=cmap, vmin=vmin, vmax=vmax)
     title_obj = ax.set_title(f"Frame 0/{array_3d.shape[0]-1}")
     plt.tight_layout()
 

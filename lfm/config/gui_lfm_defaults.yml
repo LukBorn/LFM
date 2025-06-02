@@ -17,8 +17,9 @@ stage:
 psf:
   base_directory: 'D:\'
   name_suffix: ''
-  z_layers: 120
-  z_distance_mm: 0.025
+  z_start: -1.0
+  z_end: -3.0
+  z_distance_um: 25
   n_frames: 10
   fps: 2
 camera:

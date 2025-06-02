@@ -194,9 +194,12 @@ class LFM:
         self.cam.frame_dtype = conf["camera"]["dtype"]
         self.cam.exposure_time = 1/conf["psf"]["fps"]
 
+
         self.init_stage(conf,verbose=False)
         original_pos = self.stage.get_position(verbose=True)
-
+        self.stage.move_to((original_pos[0],original_pos[1],conf["psf"]["z_start"]), verbose=False)  # move to original position
+        z_layers = list(np.arange(conf["psf"]["z_start"], conf["psf"]["z_end"],
+                                  np.sign(conf["psf"]["z_end"]-conf["psf"]["z_start"])*conf["psf"]["z_distance_um"]/1000))
         _, _, ao_single, do_single = get_full_waveforms(conf,fps = int(1/self.cam.exposure_time))
 
         # collect background frame
@@ -223,20 +226,20 @@ class LFM:
             logger.info(f"Saving PSF to {fn}")
             with h5py.File(fn, 'w') as fh5:
                 fh5.create_dataset("bg", data = bg_im, dtype=self.cam.frame_dtype)
-                fh5.create_dataset("psf", data = np.zeros(shape=(conf["psf"]["z_layers"],
+                fh5.create_dataset("psf", data = np.zeros(shape=(len(z_layers),
                                                                   self.cam.frame_shape[0], 
                                                                   self.cam.frame_shape[1])),
                                           dtype=self.cam.frame_dtype)
-                fh5.create_dataset("z_positions", data = np.zeros(shape=(conf["psf"]["z_layers"])))
+                fh5.create_dataset("z_positions", data = np.zeros(shape=(len(z_layers))))
 
-        avg_frame = np.zeros(shape=(conf["psf"]["n_frames"], self.cam.frame_shape[0], self.cam.frame_shape[1]), dtype = self.cam.frame_dtype)
+        avg_frame = np.zeros(shape=(conf["psf"]["n_frames"], self.cam.frame_shape[0], self.cam.frame_shape[1]), dtype = np.float32)
 
         with self.dao.queue_data(ao_single, do_single, finite=False, chunked=False):
-            outer = tqdm(range(conf["psf"]["z_layers"]),f"Acquiring PSF of {conf["psf"]["z_layers"]} layers with distance {conf["psf"]["z_distance_mm"]}mm",position=0, leave=True)
-            for z in range(conf["psf"]["z_layers"]): #tdqm(range(conf["psf"]["z_layers"]),f"Acquiring PSF of {conf["psf"]["z_layers"]}layers with distance {conf["psf"]["z_distance_mm"]}mm"):
+            outer = tqdm(z_layers,f"Acquiring PSF of {len(z_layers)} layers with distance {conf["psf"]["z_distance_um"]} um",position=0, leave=True)
+            for i,z in enumerate(outer):
                 avg_frame.fill(0)
                 z_pos = self.stage.get_position(verbose=False)[2]
-                for n in tqdm(range(conf["psf"]["n_frames"]), desc=f"Acquiring layer {z+1} of {conf["psf"]["z_layers"]} at zpos {z_pos:.5f}",position=0, leave=True):
+                for n in tqdm(range(conf["psf"]["n_frames"]), desc=f"Acquiring layer {i+1} of {len(z_layers)} at zpos {z_pos:.5f}",position=1, leave=False):
                     frame_data = self.cam.acquire_stack(1, verbose=False)[0][0]
                     preview_window.update(frame_data)  # Update the GUI
                     avg_frame[n] = frame_data
@@ -247,10 +250,10 @@ class LFM:
                     break
                 if conf["psf"]["name_suffix"].strip() != "":
                     with h5py.File(fn, 'a') as fh5:
-                        fh5["psf"][z, :, :] = avg_frame.mean(axis=0, dtype = self.cam.frame_dtype)
-                        fh5["z_positions"][z] = z_pos
+                        fh5["psf"][i, :, :] = avg_frame.mean(axis=0, dtype = np.float32)
+                        fh5["z_positions"][i] = z_pos
 
-                self.stage.move((0, 0, -conf["psf"]["z_distance_mm"]))
+                self.stage.move((0, 0, -conf["psf"]["z_distance_um"]/1000))
 
         self.stage.move_to(original_pos, verbose= True)
         self.uninit_stage(conf)

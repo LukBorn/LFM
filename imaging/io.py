@@ -5,6 +5,46 @@ import numpy as np
 import time
 import sys
 
+import os, pathlib, socket, glob
+import threading, queue
+
+class Paths():
+    def __init__(self, 
+                dataset_name, 
+                psf_name,
+                pn_rec='',
+                pn_psfs='', 
+                pn_out='', 
+                pn_scratch='', 
+                url_home='', verbosity=0, expand=True, create_dirs=True):
+        expand = lambda p: str(pathlib.Path(p).expanduser()) if expand else lambda p:str(p)
+        
+        
+        # paths
+        self.hostname = socket.gethostname()
+        self.dataset_name = dataset_name
+        self.pn_rec = expand(pathlib.Path(pn_rec, dataset_name))
+        self.pn_out = expand(pathlib.Path(pn_out))
+        self.pn_outrec = expand(pathlib.Path(self.pn_out, dataset_name))
+        scratch = pn_out if not len(pn_scratch) else pn_scratch
+        self.pn_scratch = expand(pathlib.Path(scratch, dataset_name))
+        self.psf_name = psf_name
+        self.pn_psfs = expand(pathlib.Path(pn_psfs))
+        self.pn_psf = expand(pathlib.Path(self.pn_psfs, psf_name))
+        
+        
+        # create directories
+        if create_dirs:
+            pathlib.Path(self.pn_outrec).mkdir(parents=True, exist_ok=True)
+
+        # files
+        self.psf = os.path.join(self.pn_psf, 'psf.h5')
+        self.raw = os.path.join(self.pn_rec, 'data.h5')
+        self.deconvolved = os.path.join(self.pn_outrec, 'deconvolved.h5')
+        #URLs
+        self.url_home = url_home
+        self.out_url = self.pn_outrec.replace(expand('~'), url_home)     
+
 class Reader:
     def __init__(self, 
                  file_path, 

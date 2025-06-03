@@ -41,8 +41,7 @@ class Paths():
             pathlib.Path(self.pn_outrec).mkdir(parents=True, exist_ok=True)
 
         # files
-        self.psf_orig = os.path.join(self.pn_psf, 'psf.h5')
-        self.psf = os.path.join(self.pn_psf, 'psf_filtered.h5')
+        self.psf = os.path.join(self.pn_psf, 'psf.h5')
         self.raw = os.path.join(self.pn_rec, 'data.h5')
         self.deconvolved = os.path.join(self.pn_outrec, 'deconvolved.h5')
         #URLs

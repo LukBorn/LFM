@@ -11,42 +11,6 @@ from daio.h5 import lazyh5
 import os, pathlib, socket, glob
 import threading, queue
 
-class Paths():
-    def __init__(self, 
-                dataset_name, 
-                psf_name,
-                pn_rec='',
-                pn_psfs='', 
-                pn_out='', 
-                pn_scratch='', 
-                url_home='', verbosity=0, expand=True, create_dirs=True):
-        expand = lambda p: str(pathlib.Path(p).expanduser()) if expand else lambda p:str(p)
-        
-        
-        # paths
-        self.hostname = socket.gethostname()
-        self.dataset_name = dataset_name
-        self.pn_rec = expand(pathlib.Path(pn_rec, dataset_name))
-        self.pn_out = expand(pathlib.Path(pn_out))
-        self.pn_outrec = expand(pathlib.Path(self.pn_out, dataset_name))
-        scratch = pn_out if not len(pn_scratch) else pn_scratch
-        self.pn_scratch = expand(pathlib.Path(scratch, dataset_name))
-        self.psf_name = psf_name
-        self.pn_psfs = expand(pathlib.Path(pn_psfs))
-        self.pn_psf = expand(pathlib.Path(self.pn_psfs, psf_name))
-        
-        
-        # create directories
-        if create_dirs:
-            pathlib.Path(self.pn_outrec).mkdir(parents=True, exist_ok=True)
-
-        # files
-        self.psf = os.path.join(self.pn_psf, 'psf.h5')
-        self.raw = os.path.join(self.pn_rec, 'data.h5')
-        self.deconvolved = os.path.join(self.pn_outrec, 'deconvolved.h5')
-        #URLs
-        self.url_home = url_home
-        self.out_url = self.pn_outrec.replace(expand('~'), url_home)         
 
 def reconstruct_vols_from_imgs_parallel(paths,
                                         img_idx=None,
@@ -265,18 +229,20 @@ def reconstruct_vols_from_imgs_parallel(paths,
 
 def reconstruct_vols_from_imgs(paths,
                                img_idx=None,
-                               params= dict(max_iter=30,
-                                            xy_pad=201,
-                                            roi_size=300,
-                                            loss_threshold = 0,
-                                            psf_downsample=1,
-                                            OTF_subtract_bg=True,
-                                            OTF_normalize=True,
-                                            img_subtract_bg=False,
-                                            img_mask=True,),
-                               max_io_threads=5,
+                               max_iter=30,
+                               xy_pad=201,
+                               roi_size=300,
+                               loss_threshold = 0,
+                               psf_downsample=1,
+                               OTF_normalize=False,
+                               OTF_clip=False,
+                               img_subtract_bg=False,
+                               img_mask=True,
+                               img_clip=True,
+                               reuse_prev_vol=True,
+                               max_io_threads=2,
                                verbose=True,
-                                ):
+                               ):
     """
     Reconstructs volumes from images using the Richardson-Lucy algorithm.
     based on the MATLAB code from Cong et al. (2017) "Rapid whole brain imaging of neural activity in freely behaving larval zebrafish (Danio rerio)"
@@ -290,14 +256,14 @@ def reconstruct_vols_from_imgs(paths,
     max_io_threads (int): Number of threads to use for IO operations. Default is 5.
     """    
 
-    max_iter, xy_pad, roi_size, loss_threshold, psf_downsample, OTF_subtract_bg, OTF_normalize, img_subtract_bg, img_mask = params.values()
+    #load background
+    
 
     # Load and preprocess PSF
-    otf_path = os.path.join(paths.pn_scratch + f"/OTF_{paths.psf_name}{"_-bg" if OTF_subtract_bg else ""}{"_norm" if OTF_normalize else ""}.npy")
+    otf_path = os.path.join(paths.pn_scratch + f"/OTF_{paths.psf_name}{"_clip" if OTF_clip else None}{"_norm" if OTF_normalize else ""}.npy")
     if os.path.exists(otf_path):
         print("Loading OTF from disk") if verbose else None
         with h5py.File(paths.psf, 'r') as f:
-            bg = cp.array(f["bg"]).astype(cp.float32)
             crop = cp.array(f["crop"])
             if img_mask:
                 mask = cp.array(f["circle_mask"])[crop[0]:crop[1], crop[2]:crop[3]]
@@ -306,26 +272,27 @@ def reconstruct_vols_from_imgs(paths,
     else:
         print("Loading PSF, Calculating OTF") if verbose else None
         with h5py.File(paths.psf, 'r') as f:
-            bg = cp.array(f["bg"]).astype(cp.float32)
             crop = cp.array(f["crop"])
             if img_mask:
                 mask = cp.array(f["circle_mask"])[crop[0]:crop[1], crop[2]:crop[3]]
             psf = cp.array(f["psf"])
   
-        size_z = int(psf.shape[0]/psf_downsample)
         size_y = psf.shape[1] + 2 * xy_pad
         size_x = psf.shape[2] + 2 * xy_pad
+        psf_downsample[1] = psf.shape[0] if psf_downsample[2] is None else psf_downsample[1] = psf[psf_downsample[1],:,:].shape[0]    
+        size_z = len(range(*psf_downsample))
+
         #calculate OTF
         OTF = cp.zeros((size_z, size_y, size_x), dtype=cp.complex64)
 
-        for z in tqdm(range(0,psf.shape[0],psf_downsample), desc=f"Calculating OTF: (downsampling PSF by{psf_downsample})"):
+        for z in tqdm(range(*psf_downsample), desc=f"Calculating OTF: (downsampling PSF by{psf_downsample[2]})"):
             slice_processed = cp.asarray(psf[z,:,:]).astype(cp.float32)
-            if OTF_subtract_bg:
-                slice_processed -= bg
+            if OTF_clip:
+                slice_processed = cp.clip(slice_processed, 0, None)
             if OTF_normalize:
                 slice_processed /= slice_processed.sum()
-            #OTF[z, :, :] = fft2(ifftshift(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')))
-            OTF[z, :, :] = fft2(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant'))
+            OTF[z, :, :] = fft2(ifftshift(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')))
+            # OTF[z, :, :] = fft2(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant'))
             # assert slice_processed.sum() = 1, "OTF not normalized"
         cp.save(otf_path, OTF)
         
@@ -388,13 +355,17 @@ def reconstruct_vols_from_imgs(paths,
             img = cp.array(data[it, :,:]).astype(cp.float32)[crop[0]:crop[1], crop[2]:crop[3]]
             if img_subtract_bg:
                 img -= bg
+            if img_clip:
+                img = cp.clip(img, 0, None)
             if img_mask:
                 img = img * mask
             img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
 
             for n_iter in tqdm(range(max_iter), leave=False):
                 img_est.fill(0)
-                # reusing obj_recon from previous frame bc they are probably very similar
+                if not reuse_prev_vol:# otherwise reusing obj_recon from previous frame bc they are probably very similar
+                    obj_recon.fill(0)
+                
                 #forward pass
                 for z in range(size_z):
                     #padding the obj_slice to center of temp_obj
@@ -430,6 +401,19 @@ def reconstruct_vols_from_imgs(paths,
     io_thread.join()
     print("Deconvolution finished") if verbose else None
 
+    kwargs = dict(max_iter=max_iter,
+                  xy_pad=xy_pad,
+                  roi_size=roi_size,
+                  loss_threshold=loss_threshold,
+                  psf_downsample=psf_downsample,
+                  OTF_normalize=OTF_normalize,
+                  OTF_clip=OTF_clip,
+                  img_subtract_bg=img_subtract_bg,
+                  img_mask=img_mask,
+                  img_clip=img_clip,
+                  reuse_prev_vol=reuse_prev_vol,)
+    
+    return paths, kwargs
 
 def reconstruct_vol_from_img(img,
                              psf=None,
@@ -438,24 +422,20 @@ def reconstruct_vol_from_img(img,
                              circle_mask=None,
                              otf_path="",
                              max_iter=30,
-                            xy_pad=201,
-                            roi_size=300,
-                            loss_threshold = 0,
-                            psf_downsample=1,
-                            OTF_subtract_bg=True,
-                            OTF_normalize=True,
-                            OTF_clip=False,
-                            img_subtract_bg=False,
-                            img_mask=True,
-                            img_clip=True,
+                             xy_pad=201,
+                             roi_size=300,
+                             loss_threshold = 0,
+                             psf_downsample=(0,None,1),
+                             OTF_normalize=False,
+                             OTF_clip=False,
+                             img_subtract_bg=False,
+                             img_mask=True,
+                             img_clip=True,
                              verbose=True,
                              plot=False,
                              pad=10,
                              ):
 
-
-    
-    
 
     if psf is None and len(otf_path)==0:
         raise ValueError("No PSF or OTF provided")
@@ -467,14 +447,13 @@ def reconstruct_vol_from_img(img,
         print("Calculating OTF") if verbose else None
         size_y = psf.shape[1] + 2 * xy_pad
         size_x = psf.shape[2] + 2 * xy_pad
-        size_z = int(psf.shape[0]/psf_downsample)
+        psf_downsample[1] = psf.shape[0] if psf_downsample[1] is None else psf[psf_downsample[1],:,:].shape[0]    
+        size_z = len(range(*psf_downsample))
 
         OTF = cp.zeros((size_z, size_y, size_x), dtype=cp.complex64)
 
-        for i,z in enumerate(tqdm(range(0,psf.shape[0],psf_downsample))):
+        for i,z in enumerate(tqdm(range(*psf_downsample))):
             slice_processed = cp.asarray(psf[z,:,:]).astype(cp.float32)
-            if OTF_subtract_bg:
-                slice_processed -= bg
             if OTF_clip:
                 slice_processed = cp.clip(slice_processed, 0, None)
             if OTF_normalize:
@@ -528,8 +507,20 @@ def reconstruct_vol_from_img(img,
             losses = losses[:it]
             plot_mip = plot_mip[:it]
             break
+    
+    kwargs = dict(max_iter=max_iter,
+                  xy_pad=xy_pad,
+                  roi_size=roi_size,
+                  loss_threshold=loss_threshold,
+                  otf_path=otf_path,
+                  psf_downsample=psf_downsample,
+                  OTF_normalize=OTF_normalize,
+                  OTF_clip=OTF_clip,
+                  img_subtract_bg=img_subtract_bg,
+                  img_mask=img_mask,
+                  img_clip=img_clip,)
 
-    return obj_recon, plot_mip, losses
+    return obj_recon, plot_mip, losses, kwargs
 
 
 def reconstruct_vol_from_img1(img,

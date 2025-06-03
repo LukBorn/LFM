@@ -5,16 +5,23 @@ import numpy as np
 import time
 import sys
 
+import os, pathlib, socket, glob
+import threading, queue
 
 class Paths():
     def __init__(self, 
-                dataset_name, 
-                psf_name,
-                pn_rec='',
-                pn_psfs='', 
-                pn_out='', 
-                pn_scratch='', 
-                url_home='', verbosity=0, expand=True, create_dirs=True):
+                 dataset_name, 
+                 psf_name,
+                 bg_name='',
+                 pn_rec='',
+                 pn_psfs='',
+                 pn_bg='',
+                 pn_out='', 
+                 pn_scratch='', 
+                 url_home='', 
+                 verbosity=0, 
+                 expand=True, 
+                 create_dirs=True):
         expand = lambda p: str(pathlib.Path(p).expanduser()) if expand else lambda p:str(p)
         
         
@@ -29,20 +36,20 @@ class Paths():
         self.psf_name = psf_name
         self.pn_psfs = expand(pathlib.Path(pn_psfs))
         self.pn_psf = expand(pathlib.Path(self.pn_psfs, psf_name))
-        
+        self.pn_bg = expand(pathlib.Path(pn_bg))
         
         # create directories
         if create_dirs:
             pathlib.Path(self.pn_outrec).mkdir(parents=True, exist_ok=True)
 
         # files
+        self.bg = os.path.join(self.pn_bg, bg_name)
         self.psf = os.path.join(self.pn_psf, 'psf.h5')
         self.raw = os.path.join(self.pn_rec, 'data.h5')
         self.deconvolved = os.path.join(self.pn_outrec, 'deconvolved.h5')
         #URLs
         self.url_home = url_home
-        self.out_url = self.pn_outrec.replace(expand('~'), url_home)         
-
+        self.out_url = self.pn_outrec.replace(expand('~'), url_home)     
 
 class Reader:
     def __init__(self, 
@@ -149,17 +156,6 @@ class Writer:
 
     def write(self, arr, idx):
         self.task_queue.put((idx, arr))
-    
-    def stop(self):
-        self.stop_event.set()
-        for t in self.workers:
-            t.join()
-
-    def wait(self):
-        self.task_queue.join()
-
-    def __del__(self):
-        self.stop()
 
     def time_one(self, arr, idx):
         """Time and report memory usage for one write operation."""
@@ -177,18 +173,13 @@ class Writer:
         mem_after = process.memory_info().rss
         print(f"Writer: idx={idx}, time={t1-t0:.4f}s, RAM used={mem_after-mem_before} bytes, arr.nbytes={arr.nbytes}")
 
-class PrevVolumeManager:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.volume = None
-        self.index= -1
-    
-    def update(self, volume, idx):
-        if idx > self.index:
-            with self.lock:
-                self.volume = volume
-                self.index = idx
+    def stop(self):
+        self.stop_event.set()
+        for t in self.workers:
+            t.join()
 
-    def get(self):
-        with self.lock:
-            return self.volume
+    def wait(self):
+        self.task_queue.join()
+
+    def __del__(self):
+        self.stop()

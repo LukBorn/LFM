@@ -4,6 +4,7 @@ import os
 import arrow
 import json
 import h5py
+import threading
 from scipy.signal import sawtooth
 from contextlib import nullcontext
 import logging
@@ -14,7 +15,7 @@ from tqdm.auto import tqdm
 
 from nidaqmx.utils import flatten_channel_string, unflatten_channel_string
 from ui.stage_controls import StageControlWindow
-from ui.preview import PreviewWindow
+from ui.preview import PreviewWindow, OldPreviewWindow
 
 from cams import DCamera as Camera
 from daq import unifiedDAO
@@ -76,49 +77,6 @@ def get_full_waveforms(conf,fps=None):
     trigger_full = SimpleArrayProxy(trigger_getter, shape=full_shape)
 
     return led_full, trigger_full, led_single, trigger_single
-
-def get_preview_callback(im_shape, edge_sz=10, refresh_every=5, window_title='Preview'):
-    """Return a callback function for generating an preview in an ImageView.
-    
-    Args:
-        im_shape (tuple): Shape of the image.
-        frames_per_vol (int): Number of frames per volume.
-        edge_sz (int): Size of the edge in pixels. Defaults to 10.
-        refresh_every (int): Refresh the image every n frames. Defaults to 30.
-
-    Returns:
-        function: Callback function.
-        function: Interrupt function.
-    """
-
-    # Create a main window with layout
-    main_window = pg.Qt.QtWidgets.QWidget()
-    layout = pg.Qt.QtWidgets.QVBoxLayout()
-    main_window.setLayout(layout)
-    main_window.setWindowTitle("PSF Preview with Z Position")
-    main_window.resize(900, 950)  # Adjust dimensions for both image and label
-    main_window.show()
-
-    # Create the ImageView and add it to the layout
-    imv = pg.ImageView()
-    imv.ui.menuBtn.hide()  # Hide unnecessary buttons
-    imv.ui.roiBtn.hide()
-    layout.addWidget(imv)  # Add ImageView to the layout
-
-    # Add a QLabel for displaying the relative Z position
-    z_label = pg.Qt.QtWidgets.QLabel()
-    layout.addWidget(z_label)
-
-    def callback(im_np, i_frame, timestamp, frame_count):
-        """Updates the displayed image every 'refresh_every' frames."""
-        if i_frame % refresh_every == 0:
-            imv.setImage(im_np[::2,::2], levels=(0, 255), autoHistogramRange=False)
-            pg.Qt.QtWidgets.QApplication.processEvents()
-
-    return callback, imv
-
-
-
 
 
 class LFM:
@@ -204,9 +162,9 @@ class LFM:
 
         # collect background frame
         logger.info('Acquiring background frame...')
-        self.cam.set_trigger(external=False)  # internal trigger because were aquiring stack not streaming data?
+        self.cam.set_trigger(external=False)  # internal trigger because were aquiring stack not streaming data
         bg_im = self.cam.acquire_stack(int(5/self.cam.exposure_time))[0].mean(0, dtype=self.cam.frame_dtype) #five seconds
-        preview_window = PreviewWindow()
+        preview_window = OldPreviewWindow()
         preview_window.update(bg_im)  # Update the GUI
 
         self.cam.set_trigger(external=True, each_frame=False)
@@ -240,7 +198,7 @@ class LFM:
                 avg_frame.fill(0)
                 z_pos = self.stage.get_position(verbose=False)[2]
                 for n in tqdm(range(conf["psf"]["n_frames"]), desc=f"Acquiring layer {i+1} of {len(z_layers)} at zpos {z_pos:.5f}",position=1, leave=False):
-                    frame_data = self.cam.acquire_stack(1, verbose=False)[0][0]
+                    frame_data = self.cam.acquire_stack(1, verbose=False)[0][0] #camera is on
                     preview_window.update(frame_data)  # Update the GUI
                     avg_frame[n] = frame_data
                     # Detect if the preview window has been closed
@@ -272,16 +230,34 @@ class LFM:
         self.cam.set_trigger(external=False, each_frame=True)
 
         preview_window = PreviewWindow()
-        def callback(im, ii, timestamp, frame_number):
-            if ii % conf["preview"]["update_every"] == 0:
-                preview_window.update(im)
+        preview_window.show()
 
-        def interrupt():
-            return not preview_window.isVisible()
+        def camera_thread():
+            def callback(im, ii, timestamp, frame_number):
+                if ii % conf["preview"]["update_every"] == 0:
+                    preview_window.update(im)
 
-        with self.dao.queue_data(ao_single, do_single, finite=True, chunked=False):
-            self.cam.stream(int(1e9), callback=callback, interrupt=interrupt)
+            def interrupt():
+                return preview_window.is_stopping()
 
+            with self.dao.queue_data(ao_single, do_single, finite=True, chunked=False):
+                self.cam.stream(int(1e9), callback=callback, interrupt=interrupt)
+
+        # Start camera streaming in a separate thread
+        thread = threading.Thread(target=camera_thread)
+        thread.daemon = True
+        preview_window.thread = thread
+        thread.start()
+
+        # Keep the main thread alive until the window is closed
+        from PyQt5 import QtWidgets
+        while preview_window.isVisible():
+            QtWidgets.QApplication.processEvents()
+
+        # Ensure thread is properly stopped
+        preview_window.stop_flag = True
+        if thread.is_alive():
+            thread.join(timeout=1.0)
 
         self.point()
         logger.info(f"Preview stopped")
@@ -318,7 +294,7 @@ class LFM:
             fh5.create_dataset("bg", data=bg_im, dtype = self.cam.frame_dtype)
 
         # set up preview
-        preview_window = PreviewWindow()
+        preview_window = OldPreviewWindow()
         preview_window.update(bg_im)
 
         # setup DAQ

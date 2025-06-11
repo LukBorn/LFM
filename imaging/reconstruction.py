@@ -2,7 +2,6 @@ import numpy as np
 import cupy as cp
 from cupy.fft import fft2, ifft2, ifftshift
 from tqdm.auto import tqdm
-from util import create_projection_image
 import h5py
 from multiprocessing import Pool, cpu_count
 from functools import partial
@@ -10,6 +9,7 @@ import tempfile
 from daio.h5 import lazyh5
 import os, pathlib, socket, glob
 import threading, queue
+from video import AVWriter, create_projection_image
 
 
 def reconstruct_vols_from_imgs_parallel(paths,
@@ -18,32 +18,38 @@ def reconstruct_vols_from_imgs_parallel(paths,
                                         xy_pad=201,
                                         roi_size=300,
                                         loss_threshold = 0,
-                                        psf_downsample=1,
+                                        psf_downsample=None,
                                         OTF_normalize=False,
                                         OTF_clip=False,
                                         img_subtract_bg=False,
                                         img_mask=True,
                                         img_clip=True,
-                                        reuse_prev_vol=True,
+                                        reuse_prev_vol=False,
+                                        write_mip_video=True,
+                                        vmin=0,
+                                        vmax=100,
+                                        fps=10,
+                                        absolute_limits=False,
+                                        force_new=False,
                                         verbose=True,
                                         ):
     
     # Load and preprocess PSF
-    otf_path = os.path.join(paths.pn_scratch + f"/OTF_{paths.psf_name}{"_clip" if OTF_clip else None}{"_norm" if OTF_normalize else ""}.npy")
+    otf_path = os.path.join(paths.pn_scratch + f"/OTF_{paths.psf_name}{"_clip" if OTF_clip else None}{"_norm" if OTF_normalize else ""}{f'_dwn{psf_downsample}' if psf_downsample is not None}.npy")
     if os.path.exists(otf_path):
         print("Loading OTF from disk") if verbose else None
         with h5py.File(paths.psf, 'r') as f:
             crop = list(f["crop"])
             if img_mask:
-                mask = cp.array(f["circle_mask"])[crop[0]:crop[1], crop[2]:crop[3]]
-        OTF = cp.load(otf_path) 
+                mask = np.array(f["circle_mask"])[crop[0]:crop[1], crop[2]:crop[3]]
+        OTF = np.load(otf_path) 
         size_z, size_y, size_x  = OTF.shape
     else:
         print("Loading PSF, Calculating OTF") if verbose else None
         with h5py.File(paths.psf, 'r') as f:
             crop = list(f["crop"])
             if img_mask:
-                mask = cp.array(f["circle_mask"])[crop[0]:crop[1], crop[2]:crop[3]]
+                mask = np.array(f["circle_mask"])[crop[0]:crop[1], crop[2]:crop[3]]
             psf = cp.array(f["psf"])
   
         size_y = psf.shape[1] + 2 * xy_pad
@@ -67,7 +73,8 @@ def reconstruct_vols_from_imgs_parallel(paths,
             # OTF[z, :, :] = fft2(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant'))
             # assert slice_processed.sum() = 1, "OTF not normalized"
         cp.save(otf_path, OTF)
-        del psf
+        OTF = OTF.get()
+        del psf 
 
 
     print("Setting up I/O queues") if verbose else None
@@ -84,6 +91,30 @@ def reconstruct_vols_from_imgs_parallel(paths,
             n_img = len(read_idx)
             save_fn = paths.deconvolved[:-3]+ f"_frames{img_idx[0]}-{img_idx[1]}.h5"
 
+    if os.path.exists(save_fn) and not force_new:
+        with h5py.File(save_fn, 'r') as f:
+            params = f['deconvolution_params']
+            param_match = (
+                params.attrs.get('roi_size', -1) == roi_size and
+                params.attrs.get('xy_pad', -1) == xy_pad and
+                params.attrs.get('max_iter', -1) == max_iter and
+                params.attrs.get('loss_threshold', -1) == loss_threshold and
+                params.attrs.get('OTF', -1) == otf_path and
+                params.attrs.get('reuse_prev_vol', -1) == reuse_prev_vol and
+                params.attrs.get('img_subtract_bg', -1) == img_subtract_bg and
+                params.attrs.get('img_mask', -1) == img_mask
+                )
+            if param_match:
+                processed_indices = f['processed_indices'][:]
+            if processed_indices:
+                print(f"Resuming from existing file. {len(processed_indices)}/{n_img} volumes already processed.") if verbose else None
+                read_idx = [i for i in read_idx if i not in processed_indices]
+                n_img = len(read_idx)
+            else:
+                print("Parameters do not match, overwriting existing file.") if verbose else None
+    else:
+        print(f"Writing into new file: {save_fn}") if verbose else None
+
     # set up reading queue
     n_gpus = cp.cuda.runtime.getDeviceCount()
     stop_event = threading.Event()
@@ -92,11 +123,12 @@ def reconstruct_vols_from_imgs_parallel(paths,
     def reader_worker(stop_event):
         with h5py.File(paths.raw, 'r') as f:
             read_loop = tqdm(read_idx, desc="Reader") if verbose else read_idx
-            for it, raw_index in enumerate(read_loop):
+            for it, frame_n in enumerate(read_loop):
                 if stop_event.is_set():
                     break
-                read_queue.put((it,f["data"][raw_index, crop[0]:crop[1], crop[2]:crop[3]]))
-        read_queue.put(None)
+                read_queue.put((it,f["data"][frame_n, crop[0]:crop[1], crop[2]:crop[3]],frame_n))
+        for i in range(n_gpus):
+            read_queue.put(None)
     reader_thread = threading.Thread(target=reader_worker, args=(stop_event,))
     reader_thread.start()
 
@@ -113,9 +145,11 @@ def reconstruct_vols_from_imgs_parallel(paths,
             grp.attrs["xy_pad"] = xy_pad
             grp.attrs["max_iter"] = max_iter
             grp.attrs["loss_threshold"] = loss_threshold
-            grp.attrs["OTF_normalize"] = OTF_normalize
+            grp.attrs["OTF"] = otf_path
+            grp.attrs["reuse_prev_vol"] = reuse_prev_vol
             grp.attrs["img_subtract_bg"] = img_subtract_bg
             grp.attrs["img_mask"] = img_mask
+            processed_indices = []
 
             while not stop_event.is_set():
                 item = write_queue.get()
@@ -125,11 +159,41 @@ def reconstruct_vols_from_imgs_parallel(paths,
                 dset[it, :, :, :] = obj_recon
                 losses[it,:] = loss
                 n_iters[it] = n_iter
+                processed_indices.append(it)
                 dset.flush()
                 write_queue.task_done()
+            f.create_dataset("processed_indices", data=processed_indices)
     writer_thread = threading.Thread(target=writer_worker, args=(stop_event,))
     writer_thread.start()
 
+    if write_mip_video:
+        
+        video_writer_queue = queue.Queue(maxsize=n_gpus*2+1) 
+        fn_vid = save_fn.replace('.h5', f"_mip_vmin{vmin}_vmax{vmax}{'_al' if absolute_limits else ''}.mp4")
+        def video_writer_worker(stop_event):
+            next_idx = 0
+            buffer = {}
+            video_writer=None
+            while not stop_event.is_set():
+                idx, mip = video_writer_queue.get()
+                if mip is None:
+                    break
+                if video_writer is None:
+                    video_writer = AVWriter(fn_vid, 
+                                            height=mip.shape[0],
+                                            width=mip.shape[1],
+                                            fps=fps,
+                                            pix_fmt='yuv420p',
+                                            out_fmt='gray',)
+                buffer[idx] = mip
+                while next_idx in buffer:
+                    video_writer.write(mip.astype(np.uint8))
+                    del buffer[next_idx]
+                    next_idx += 1
+                video_writer_queue.task_done()
+        video_writer_thread = threading.Thread(target=video_writer_worker, args=(stop_event,))
+        video_writer_thread.start()
+        
 
     class PrevVolumeManager:
         def __init__(self):
@@ -139,7 +203,6 @@ def reconstruct_vols_from_imgs_parallel(paths,
         
         def update(self, volume, idx):
             if reuse_prev_vol:
-                print(f"Updating previous volume with index {idx}") if verbose else None
                 if idx > self.index:
                     with self.lock:
                         self.volume = volume
@@ -157,6 +220,8 @@ def reconstruct_vols_from_imgs_parallel(paths,
             self.gpu_id = gpu_id
             cp.cuda.Device(gpu_id).use()
             print(f"GPU {gpu_id}: Initializing Memory") if verbose else None
+            self.OTF = cp.asarray(OTF)
+            self.mask = cp.asarray(mask) if img_mask else None
 
             self.temp_obj = cp.zeros((size_y, size_x), dtype=cp.float32)
             self.img_padded = cp.zeros((size_y, size_x), dtype=cp.float32)        
@@ -167,10 +232,10 @@ def reconstruct_vols_from_imgs_parallel(paths,
 
         def deconvolve(self, it, img):
             if img_subtract_bg: img -= bg
-            if img_mask: img *= mask
+            if img_mask: img *= self.mask
             self.img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
 
-            self.obj_recon = cp.asarray(prev_volume_manager.get())
+            self.obj_recon = cp.asarray(prev_volume_manager.get()).copy()
 
             loop = tqdm(range(max_iter), desc=f"GPU {self.gpu_id}: Deconvolving image {it+1}/{n_img}", leave=False) if verbose else range(max_iter)
 
@@ -183,7 +248,7 @@ def reconstruct_vols_from_imgs_parallel(paths,
                     self.temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size,
                                   size_x // 2 - roi_size: size_x // 2 + roi_size] = self.obj_recon[z, :, :]
                     # adding the contribution of each slice to the image estimate
-                    self.img_est += cp.maximum(cp.real(ifft2(OTF[z, :, :] * fft2(self.temp_obj))), 0)
+                    self.img_est += cp.maximum(cp.real(ifft2(self.OTF[z, :, :] * fft2(self.temp_obj))), 0)
                 #calculate ratio
                 self.ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad] = self.img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] / (
                         self.img_est[xy_pad:-xy_pad, xy_pad:-xy_pad] + cp.finfo(cp.float32).eps)
@@ -193,7 +258,7 @@ def reconstruct_vols_from_imgs_parallel(paths,
                     self.temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size,
                                   size_x // 2 - roi_size: size_x // 2 + roi_size] = self.obj_recon[z, :, :]
                     #updating the object estimate 
-                    self.temp = self.temp_obj * (cp.maximum(cp.real(ifft2(fft2(self.ratio_img) * cp.conj(OTF[z, :, :]))), 0))
+                    self.temp = self.temp_obj * (cp.maximum(cp.real(ifft2(fft2(self.ratio_img) * cp.conj(self.OTF[z, :, :]))), 0))
                     self.obj_recon[z, :, :] = self.temp[size_y // 2 - roi_size: size_y // 2 + roi_size,
                                                         size_x // 2 - roi_size: size_x // 2 + roi_size]
                 #calculate loss
@@ -201,7 +266,7 @@ def reconstruct_vols_from_imgs_parallel(paths,
                 loss = cp.mean(cp.abs(cp.log(ratio_[ratio_>0])))
                 self.losses[iter] = loss
                 if loss < loss_threshold:
-                    break
+                    break      
                 
             return self.obj_recon.get(), self.losses.get(), iter
                 
@@ -211,11 +276,16 @@ def reconstruct_vols_from_imgs_parallel(paths,
         while True:
             item = read_queue.get()
             if item is None:
-                write_queue.put(None)  # Signal writer this GPU is done
                 break
-            idx, img = item
+            idx, img, frame_n = item
             obj_recon, losses_arr, n_iter = worker.deconvolve(idx, cp.array(img))
+            mip = create_projection_image(obj_recon, 
+                                          text=str(frame_n), 
+                                          vmin=vmin,vmax=vmax,
+                                          absolute_limits=absolute_limits) if write_mip_video else None
             write_queue.put((idx, obj_recon, losses_arr, n_iter))
+            if write_mip_video:
+                video_writer_queue.put((idx, mip))
             prev_volume_manager.update(obj_recon, idx)
             read_queue.task_done()
 
@@ -230,10 +300,12 @@ def reconstruct_vols_from_imgs_parallel(paths,
         t.join()
     # Stop the IO thread
     stop_event.set()
-    read_queue.put(None)
     write_queue.put(None)
     reader_thread.join()
     writer_thread.join()
+    if write_mip_video:
+        video_writer_queue.put(None)
+        video_writer_thread.join()
     print("Deconvolution finished") if verbose else None
 
     kwargs = dict(max_iter=max_iter,
@@ -248,7 +320,7 @@ def reconstruct_vols_from_imgs_parallel(paths,
                   img_clip=img_clip,
                   reuse_prev_vol=reuse_prev_vol,)
     
-    return kwargs, save_fn
+    return kwargs, save_fn, fn_vid if write_mip_video else None
 
 
 
@@ -530,7 +602,7 @@ def reconstruct_vol_from_img(img,
             obj_recon[z, :, :] = temp[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size]
 
         if plot:
-            plot_mip[it,:,:] = create_projection_image(obj_recon,cp.max,pad)
+            plot_mip[it,:,:] = create_projection_image(obj_recon,pad=pad)
 
         ratio_ = ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad]
         calc_loss = cp.mean(cp.abs(cp.log(ratio_[ratio_>0])))
@@ -660,7 +732,7 @@ def reconstruct_vol_from_img1(img,
             obj_recon[z, :, :] = temp[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size]
 
         if plot:
-            plot_mip[it,:,:] = create_projection_image(obj_recon,cp.max,pad)
+            plot_mip[it,:,:] = create_projection_image(obj_recon,pad=pad)
 
         ratio_ = ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad]
         calc_loss = cp.mean(cp.abs(cp.log(ratio_[ratio_>0])))

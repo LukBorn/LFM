@@ -66,57 +66,7 @@ def array_to_video(array_3d, filename=None, fps=10, cmap='viridis', title=None, 
 
 
 
-def create_projection_image(volume, projection_func=None, pad=10):
-    """
-    Creates a 2D image showing projections of a 3D volume along all three axes.
 
-    Parameters:
-    -----------
-    volume : cp.ndarray or np.ndarray
-        3D input volume of shape (depth, height, width)
-    projection_func : callable, optional
-        Function to use for projection (e.g., np.max, np.mean, np.sum)
-        Defaults to max if None is provided
-    pad : int
-        Padding between the projections
-
-    Returns:
-    --------
-    projection_image : same type as volume
-        2D image showing all three projections arranged with:
-        - xy (axial) in the center
-        - xz at the bottom
-        - yz on the right side
-    """
-    # Get dimensions
-    depth, height, width = volume.shape
-
-    # Calculate output dimensions with padding
-    output_height = height + depth + 3 * pad
-    output_width = width + depth + 3 * pad
-
-    # Create empty output image (using same array type as input)
-    if isinstance(volume, np.ndarray):
-        output = np.zeros((output_height, output_width), dtype=volume.dtype)
-        if projection_func is None:
-            projection_func = np.max
-    elif isinstance(volume, cp.ndarray):
-        output = cp.zeros((output_height, output_width), dtype=volume.dtype)
-        if projection_func is None:
-            projection_func = cp.max
-    else:
-        raise TypeError("Volume must be of type cp.ndarray or cp.ndarray")
-
-    # XY projection (center)
-    output[pad:pad + height, pad:pad + width] = projection_func(volume, axis=0)
-
-    # XZ projection (bottom)
-    output[pad + height + pad:pad + height + pad + depth, pad:pad + width] = projection_func(volume, axis=1)
-
-    # YZ projection (right side) - needs transpose to align correctly
-    output[pad:pad + height, pad + width + pad:pad + width + pad + depth] = projection_func(volume, axis=2).T
-
-    return output
 
 
 def generate_random_gaussians_3d(shape,

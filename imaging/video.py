@@ -63,7 +63,16 @@ class AVWriter:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-def create_projection_image(volume, projection="max", vmin=0,vmax=100,absolute_limits=False,pad=None, text=None):
+def create_projection_image(volume, 
+                            projection="max", 
+                            vmin=0,
+                            vmax=100,
+                            absolute_limits=False,
+                            pad=None, 
+                            text=None,
+                            text_size=3,
+                            scalebar=200, 
+                            zpos=None,):
     """
     Creates a 2D image showing projections of a 3D volume along all three axes.
 
@@ -79,9 +88,13 @@ def create_projection_image(volume, projection="max", vmin=0,vmax=100,absolute_l
         upper percentile (0-100) or absolute limit, depending on absolute_lims flag
     absolute_lims (bool): 
         whether vmin or vmax are interpreted as absolute limits or percentiles
-
+    text : str or None
+        Text to overlay on the projection image. If None, no text is added.
+    scalebar : float or None
+        Length of the scalebar in um.
+    zpos: array of shape volume.shape[0] or None
+        z positions for the scalebar. If None, no scalebar is added.
     
-    vmin : float
     pad : int
         Padding between the projections
 
@@ -124,18 +137,44 @@ def create_projection_image(volume, projection="max", vmin=0,vmax=100,absolute_l
     # YZ projection (right side) 
     output[pad:pad + height, pad + width + pad:pad + width + pad + depth] = projection_func(volume, axis=2).T
 
-    output = get_clipped_array(output, vmin=vmin, vmax=vmax, absolute_limits=absolute_limits)
+    output = get_clipped_array(output, vmin=vmin, vmax=vmax, absolute_limits=absolute_limits).get()
 
+    color = 240 if not absolute_limits else int(0.95*vmax)
     if text is not None:
-        font, lineType = cv2.FONT_HERSHEY_PLAIN, 2
-        text_width, text_height = cv2.getTextSize(text, font, 2, lineType)[0]
+        font, lineType = cv2.FONT_HERSHEY_PLAIN, text_size+1
+        text_width, text_height = cv2.getTextSize(text, font, text_size, lineType)[0]
         org = (output_width - pad - text_width, output_height - pad)
-        output = cv2.putText(output.get(), text, 
+        output = cv2.putText(output, text, 
                              org=org, 
                              fontFace=font,
-                             fontScale=2, 
-                             color = (int(vmax), int(vmax), int(vmax)),
+                             fontScale=text_size, 
+                             color = color,
                              thickness=lineType)
+    if zpos is not None:
+        # Draw a scalebar at the bottom of the xz projection
+        scalebar_length = int((scalebar*0.001 / (np.abs(zpos[-1]) - np.abs(zpos[0]))) * depth)
+        output = cv2.line(output,
+                          (width-pad, height+pad), 
+                          (width-pad, height+scalebar_length+pad), 
+                          color=color, 
+                          thickness=4)
+        # Draw a scalebar at the bottom of the yz projection
+        output = cv2.line(output,
+                          (width+pad, height-pad), 
+                          (width+pad+scalebar_length, height-pad), 
+                          color=color, 
+                          thickness=4)
+        # Add text for the scalebar
+        text = f"{scalebar} um"
+        font, lineType = cv2.FONT_HERSHEY_PLAIN, text_size+1
+        text_width, text_height = cv2.getTextSize(text, font, text_size, lineType)[0]
+        org = (width, height + pad//2+ text_height)
+        output = cv2.putText(output, text, 
+                             org=org, 
+                             fontFace=font,
+                             fontScale=text_size, 
+                             color = color,
+                             thickness=lineType)    
 
     return output
 

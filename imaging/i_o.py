@@ -45,6 +45,7 @@ class Paths():
         # files
         self.bg = os.path.join(self.pn_bg, bg_name)
         self.psf = os.path.join(self.pn_psf, 'psf.h5')
+        self.meta = os.path.join(self.pn_rec, 'meta.json')
         self.raw = os.path.join(self.pn_rec, 'data.h5')
         self.deconvolved = os.path.join(self.pn_outrec, 'deconvolved.h5')
         #URLs

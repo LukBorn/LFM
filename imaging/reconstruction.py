@@ -2,54 +2,43 @@ import numpy as np
 import cupy as cp
 from cupy.fft import fft2, ifft2, ifftshift
 from tqdm.auto import tqdm
-import h5py
+import h5py, json
 from multiprocessing import Pool, cpu_count
 from functools import partial
 import tempfile
 from daio.h5 import lazyh5
-import os, pathlib, socket, glob
-import threading, queue
+import os, pathlib, socket, glob, traceback
+import threading, queue, time
 from video import AVWriter, create_projection_image
+from slurm import SlowProgressLogger
 
 
-def reconstruct_vols_from_imgs_parallel(paths,
-                                        img_idx=None,
-                                        max_iter=30,
-                                        xy_pad=201,
-                                        roi_size=300,
-                                        loss_threshold = 0,
-                                        psf_downsample=None,
-                                        OTF_normalize=False,
-                                        OTF_clip=False,
-                                        img_subtract_bg=False,
-                                        img_mask=True,
-                                        img_clip=True,
-                                        reuse_prev_vol=False,
-                                        write_mip_video=True,
-                                        vmin=0,
-                                        vmax=100,
-                                        fps=10,
-                                        absolute_limits=False,
-                                        force_new=False,
-                                        verbose=True,
-                                        ):
-    
-    # Load and preprocess PSF
-    otf_path = os.path.join(paths.pn_scratch + f"/OTF_{paths.psf_name}{"_clip" if OTF_clip else None}{"_norm" if OTF_normalize else ""}{f'_dwn{psf_downsample}' if psf_downsample is not None}.npy")
+def get_OTF(paths,
+            OTF_normalize=True,
+            OTF_clip=False,
+            psf_downsample=None,
+            xy_pad=201,
+            verbose=True
+            ):
+    otf_path = os.path.join(paths.pn_scratch + f"/OTF_{paths.psf_name}_pad{xy_pad}{"_clip" if OTF_clip else ""}{"_norm" if OTF_normalize else ""}{f'_dwn{psf_downsample}' if psf_downsample is not None else ''}.npy")
+    if psf_downsample is None:
+        psf_downsample = [0, None, 1]
     if os.path.exists(otf_path):
         print("Loading OTF from disk") if verbose else None
         with h5py.File(paths.psf, 'r') as f:
             crop = list(f["crop"])
-            if img_mask:
-                mask = np.array(f["circle_mask"])[crop[0]:crop[1], crop[2]:crop[3]]
+            mask = np.array(f["circle_mask"])[crop[0]:crop[1], crop[2]:crop[3]]    
+            zpos = np.array(f["z_positions"])
+            zpos = zpos[psf_downsample[0]:psf_downsample[1]:psf_downsample[2]] if psf_downsample is not None else zpos
         OTF = np.load(otf_path) 
         size_z, size_y, size_x  = OTF.shape
     else:
         print("Loading PSF, Calculating OTF") if verbose else None
         with h5py.File(paths.psf, 'r') as f:
             crop = list(f["crop"])
-            if img_mask:
-                mask = np.array(f["circle_mask"])[crop[0]:crop[1], crop[2]:crop[3]]
+            mask = np.array(f["circle_mask"])[crop[0]:crop[1], crop[2]:crop[3]]
+            zpos = np.array(f["z_positions"])
+            zpos = zpos[psf_downsample[0]:psf_downsample[1]:psf_downsample[2]] if psf_downsample is not None else zpos
             psf = cp.array(f["psf"])
   
         size_y = psf.shape[1] + 2 * xy_pad
@@ -63,7 +52,7 @@ def reconstruct_vols_from_imgs_parallel(paths,
         #calculate OTF
         OTF = cp.zeros((size_z, size_y, size_x), dtype=cp.complex64)
 
-        for i,z in enumerate(tqdm(range(*psf_downsample), desc=f"Calculating OTF: (downsampling PSF by{psf_downsample[2]})")):
+        for i,z in enumerate(tqdm(range(*psf_downsample), desc=f"Calculating OTF: (downsampling PSF by {psf_downsample[2]})")):
             slice_processed = cp.asarray(psf[z,:,:]).astype(cp.float32)
             if OTF_clip:
                 slice_processed = cp.clip(slice_processed, 0, None)
@@ -76,9 +65,101 @@ def reconstruct_vols_from_imgs_parallel(paths,
         OTF = OTF.get()
         del psf 
 
+    return OTF, size_z, size_y, size_x, crop, mask, zpos, otf_path
+
+def video_writer_worker(fn_vid,
+                        video_writer_queue,
+                        fps,
+                        stop_event):
+    next_idx = 0
+    buffer = {}
+    video_writer=None
+    while not stop_event.is_set():
+        item = video_writer_queue.get()
+        if item is None:
+            break
+        idx, mip = item
+        if video_writer is None:
+            video_writer = AVWriter(fn_vid, 
+                                    height=mip.shape[0],
+                                    width=mip.shape[1],
+                                    fps=fps,
+                                    pix_fmt='yuv420p',
+                                    out_fmt='gray',)
+        buffer[idx] = mip
+        while next_idx in buffer:
+            video_writer.write(mip.astype(np.uint8))
+            del buffer[next_idx]
+            next_idx += 1
+        video_writer_queue.task_done()
+
+class PrevVolumeManager:
+    def __init__(self, size_z, roi_size, reuse_prev_vol):
+        self.lock = threading.Lock()
+        self.volume = cp.ones((size_z, 2 * roi_size, 2 * roi_size), dtype=cp.float32)
+        self.index= -1
+        self.reuse_prev_vol = reuse_prev_vol
+    
+    def update(self, volume, idx):
+        if self.reuse_prev_vol:
+            if idx > self.index:
+                with self.lock:
+                    self.volume = volume
+                    self.index = idx
+
+    def get(self):   
+        with self.lock:
+            return self.volume
+
+def reconstruct_vols_from_imgs_parallel(paths,
+                                        img_idx=None,
+                                        max_iter=30,
+                                        xy_pad=201,
+                                        roi_size=300,
+                                        loss_threshold = 0,
+                                        psf_downsample=None,
+                                        OTF_normalize=False,
+                                        OTF_clip=False,
+                                        crop=None,
+                                        img_subtract_bg=False,
+                                        img_mask=True,
+                                        img_clip=True,
+                                        reuse_prev_vol=False,
+                                        fully_batched=False,
+                                        write_mip_video=True,
+                                            vmin=0,
+                                            vmax=100,
+                                            absolute_limits=False,
+                                        force_new=False,
+                                        verbose=True,
+                                        ):
+    start_time = time.time()
+
+    # Load or preprocess PSF
+    OTF, size_z, size_y, size_x, _crop, mask, zpos, otf_path = get_OTF(paths,
+                                                                       OTF_normalize=OTF_normalize,
+                                                                       OTF_clip=OTF_clip,
+                                                                       psf_downsample=psf_downsample,
+                                                                       xy_pad=xy_pad,
+                                                                       verbose=verbose,
+                                                            )
+    
+    crop = _crop if crop is None else crop
+
+
+    fps = json.load(paths.meta)["acquisition"]["fps"]
+    led_pwr = json.load(paths.meta)["acquisition"]["led_percent"]
+
+    if paths.bg is not "" and img_subtract_bg:
+        with open(paths.bg) as file:
+            bg_data = lazyh5(file)
+            if (fps, led_pwr) != (bg_data["fps"], bg_data["led_percent"]):
+                raise Warning(f"Background data fps ({bg_data['fps']}) and led power ({bg_data['led_percent']}) do not match acquisition data fps ({fps}) and led power ({led_pwr}). This may lead to incorrect background subtraction.")
+            bg = bg_data["data"]
+
 
     print("Setting up I/O queues") if verbose else None
-    bg = cp.load(paths.bg) if img_subtract_bg else None
+    bg = np.load(paths.bg) 
     #determine the read indexes
     with h5py.File(paths.raw, 'r') as f:
         if img_idx is None:
@@ -91,27 +172,35 @@ def reconstruct_vols_from_imgs_parallel(paths,
             n_img = len(read_idx)
             save_fn = paths.deconvolved[:-3]+ f"_frames{img_idx[0]}-{img_idx[1]}.h5"
 
+
+    # handle existing files
     if os.path.exists(save_fn) and not force_new:
-        with h5py.File(save_fn, 'r') as f:
-            params = f['deconvolution_params']
-            param_match = (
-                params.attrs.get('roi_size', -1) == roi_size and
-                params.attrs.get('xy_pad', -1) == xy_pad and
-                params.attrs.get('max_iter', -1) == max_iter and
-                params.attrs.get('loss_threshold', -1) == loss_threshold and
-                params.attrs.get('OTF', -1) == otf_path and
-                params.attrs.get('reuse_prev_vol', -1) == reuse_prev_vol and
-                params.attrs.get('img_subtract_bg', -1) == img_subtract_bg and
-                params.attrs.get('img_mask', -1) == img_mask
-                )
+        try:
+            with h5py.File(save_fn, 'r') as f:
+                params = f['deconvolution_params']
+                param_match = (
+                    params.attrs.get('OTF', -1) == otf_path and
+                    params.attrs.get('roi_size', -1) == roi_size and
+                    params.attrs.get('max_iter', -1) == max_iter and
+                    params.attrs.get('loss_threshold', -1) == loss_threshold and
+                    params.attrs.get('reuse_prev_vol', -1) == reuse_prev_vol and
+                    params.attrs.get('img_subtract_bg', -1) == img_subtract_bg and
+                    params.attrs.get('img_mask', -1) == img_mask
+                    )
             if param_match:
                 processed_indices = f['processed_indices'][:]
-            if processed_indices:
                 print(f"Resuming from existing file. {len(processed_indices)}/{n_img} volumes already processed.") if verbose else None
                 read_idx = [i for i in read_idx if i not in processed_indices]
                 n_img = len(read_idx)
             else:
                 print("Parameters do not match, overwriting existing file.") if verbose else None
+                os.remove(save_fn)
+        except (OSError, KeyError):
+            print("File exists but is not compatible, overwriting existing file.") if verbose else None
+            os.remove(save_fn)
+    elif os.path.exists(save_fn) and force_new:
+        print(f"Overwriting existing file: {save_fn}") if verbose else None
+        os.remove(save_fn)
     else:
         print(f"Writing into new file: {save_fn}") if verbose else None
 
@@ -121,20 +210,27 @@ def reconstruct_vols_from_imgs_parallel(paths,
 
     read_queue = queue.Queue(maxsize=n_gpus*2+1)
     def reader_worker(stop_event):
-        with h5py.File(paths.raw, 'r') as f:
-            read_loop = tqdm(read_idx, desc="Reader") if verbose else read_idx
-            for it, frame_n in enumerate(read_loop):
-                if stop_event.is_set():
-                    break
-                read_queue.put((it,f["data"][frame_n, crop[0]:crop[1], crop[2]:crop[3]],frame_n))
-        for i in range(n_gpus):
-            read_queue.put(None)
+        try:
+            with h5py.File(paths.raw, 'r') as f:
+                read_loop = tqdm(read_idx, desc="Reader") if verbose else read_idx
+                for it, frame_n in enumerate(read_loop):
+                    if stop_event.is_set():
+                        break
+                    read_queue.put((it,f["data"][frame_n, crop[0]:crop[1], crop[2]:crop[3]],frame_n))
+            for i in range(n_gpus):
+                read_queue.put(None)
+        except Exception as e:
+            print(f"Error in reader worker:\n{traceback.format_exc()}")
+            stop_event.set()
+            for i in range(n_gpus):
+                read_queue.put(None)
     reader_thread = threading.Thread(target=reader_worker, args=(stop_event,))
     reader_thread.start()
 
     # set up writing queue
     write_queue = queue.Queue(maxsize=n_gpus*2+1)
     def writer_worker(stop_event):
+        progress= SlowProgressLogger(n_img, description="Writer", update_interval=60) if verbose else None
         with h5py.File(save_fn, 'w') as f:
             # Create dataset for the reconstructed volume     
             dset = f.create_dataset("data", shape=(n_img, size_z, 2*roi_size, 2*roi_size), dtype=np.float32)        
@@ -151,87 +247,66 @@ def reconstruct_vols_from_imgs_parallel(paths,
             grp.attrs["img_mask"] = img_mask
             processed_indices = []
 
-            while not stop_event.is_set():
-                item = write_queue.get()
-                if item is None:
-                    break
-                it, obj_recon, loss, n_iter = item
-                dset[it, :, :, :] = obj_recon
-                losses[it,:] = loss
-                n_iters[it] = n_iter
-                processed_indices.append(it)
-                dset.flush()
-                write_queue.task_done()
-            f.create_dataset("processed_indices", data=processed_indices)
+            try:
+                while not stop_event.is_set():
+                    item = write_queue.get()
+                    if item is None:
+                        break
+                    it, obj_recon, loss, n_iter = item
+                    dset[it, :, :, :] = obj_recon
+                    losses[it,:] = loss
+                    n_iters[it] = n_iter
+                    processed_indices.append(it)
+                    dset.flush()
+                    write_queue.task_done()
+                    progress.update()
+                f.create_dataset("processed_indices", data=processed_indices)
+            except Exception as e:
+                print(f"Error in writer worker:\n{traceback.format_exc()}")
+                stop_event.set()
+                f.create_dataset("processed_indices", data=processed_indices)
+            progress.finish() if verbose else None
     writer_thread = threading.Thread(target=writer_worker, args=(stop_event,))
     writer_thread.start()
 
     if write_mip_video:
-        
         video_writer_queue = queue.Queue(maxsize=n_gpus*2+1) 
         fn_vid = save_fn.replace('.h5', f"_mip_vmin{vmin}_vmax{vmax}{'_al' if absolute_limits else ''}.mp4")
-        def video_writer_worker(stop_event):
-            next_idx = 0
-            buffer = {}
-            video_writer=None
-            while not stop_event.is_set():
-                idx, mip = video_writer_queue.get()
-                if mip is None:
-                    break
-                if video_writer is None:
-                    video_writer = AVWriter(fn_vid, 
-                                            height=mip.shape[0],
-                                            width=mip.shape[1],
-                                            fps=fps,
-                                            pix_fmt='yuv420p',
-                                            out_fmt='gray',)
-                buffer[idx] = mip
-                while next_idx in buffer:
-                    video_writer.write(mip.astype(np.uint8))
-                    del buffer[next_idx]
-                    next_idx += 1
-                video_writer_queue.task_done()
-        video_writer_thread = threading.Thread(target=video_writer_worker, args=(stop_event,))
+        video_writer_thread = threading.Thread(target=video_writer_worker, args=(fn_vid,video_writer_queue,fps,stop_event))
         video_writer_thread.start()
         
-
-    class PrevVolumeManager:
-        def __init__(self):
-            self.lock = threading.Lock()
-            self.volume = cp.ones((size_z, 2 * roi_size, 2 * roi_size), dtype=cp.float32)
-            self.index= -1
-        
-        def update(self, volume, idx):
-            if reuse_prev_vol:
-                if idx > self.index:
-                    with self.lock:
-                        self.volume = volume
-                        self.index = idx
-
-        def get(self):   
-            with self.lock:
-                return self.volume
-        
-    prev_volume_manager = PrevVolumeManager()
-    
+    prev_volume_manager = PrevVolumeManager(size_z=size_z, roi_size=roi_size, reuse_prev_vol=reuse_prev_vol)
 
     class GPUWorker:
-        def __init__(self, gpu_id):
+        def __init__(self, gpu_id, fully_batched=False):
             self.gpu_id = gpu_id
             cp.cuda.Device(gpu_id).use()
-            print(f"GPU {gpu_id}: Initializing Memory") if verbose else None
+            
             self.OTF = cp.asarray(OTF)
             self.mask = cp.asarray(mask) if img_mask else None
+            self.bg = cp.asarray(bg) if img_subtract_bg else None
+            self.fully_batched = fully_batched
+            self.init_memory()
 
-            self.temp_obj = cp.zeros((size_y, size_x), dtype=cp.float32)
-            self.img_padded = cp.zeros((size_y, size_x), dtype=cp.float32)        
-            self.img_est = cp.zeros((size_y, size_x), dtype=cp.float32)
-            self.ratio_img = cp.zeros((size_y, size_x), dtype=cp.float32)
-            self.temp = cp.zeros((size_y, size_x), dtype=cp.float32)
-            self.losses = cp.zeros(max_iter, dtype=cp.float32)
+        def init_memory(self):
+            if not self.fully_batched:
+                print(f"GPU {self.gpu_id}: Initializing Memory") if verbose else None
+                self.temp_obj = cp.zeros((size_y, size_x), dtype=cp.float32)
+                self.img_padded = cp.zeros((size_y, size_x), dtype=cp.float32)        
+                self.img_est = cp.zeros((size_y, size_x), dtype=cp.float32)
+                self.ratio_img = cp.zeros((size_y, size_x), dtype=cp.float32)
+                self.temp = cp.zeros((size_y, size_x), dtype=cp.float32)
+                self.losses = cp.zeros(max_iter, dtype=cp.float32)
+            else:
+                print(f"GPU {self.gpu_id}: Initializing Memory for fully batched deconvolution") if verbose else None
+                self.temp_obj = cp.zeros((size_z, size_y, size_x), dtype=cp.float32)
+                self.img_est = cp.zeros((size_y, size_x), dtype=cp.float32)
+                self.ratio_img = cp.zeros((size_y, size_x), dtype=cp.float32)
+                self.img_padded = cp.zeros((size_y, size_x), dtype=cp.float32)
+                self.losses = cp.zeros(max_iter, dtype=cp.float32)
 
         def deconvolve(self, it, img):
-            if img_subtract_bg: img -= bg
+            if img_subtract_bg: img -= self.bg
             if img_mask: img *= self.mask
             self.img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
 
@@ -269,25 +344,80 @@ def reconstruct_vols_from_imgs_parallel(paths,
                     break      
                 
             return self.obj_recon.get(), self.losses.get(), iter
-                
+        
+        def deconvolve_batch(self, it, img):
+            if img_subtract_bg: img -= bg
+            if img_mask: img *= self.mask
+            self.img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
 
+            self.obj_recon = cp.asarray(prev_volume_manager.get()).copy()
+
+            loop = tqdm(range(max_iter), desc=f"GPU {self.gpu_id}: Deconvolving image {it+1}/{n_img}", leave=False) if verbose else range(max_iter)
+
+            for iter in loop:
+                self.img_est.fill(0)
+                self.temp_obj.fill(0)
+
+                self.temp_obj[:,size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = self.obj_recon[:, :, :]
+
+                self.img_est = cp.clip(cp.real(ifft2(self.OTF * fft2(self.temp_obj, axes=(1,2)), axes=(1,2))), 0, None).sum(axis=0)
+                
+                self.ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad] = self.img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] / (
+                    self.img_est[xy_pad:-xy_pad, xy_pad:-xy_pad] + cp.finfo(cp.float32).eps)
+                
+                self.temp_obj *= cp.clip(cp.real(ifft2(fft2(self.ratio_img) * cp.conj(self.OTF), axes=(1,2))), 0, None)
+                
+                self.obj_recon[:, :, :] = self.temp_obj[:, size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size]
+                ratio_ = self.ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad]
+                loss = cp.mean(cp.abs(cp.log(ratio_[ratio_>0])))
+                if loss < loss_threshold:
+                    break      
+                
+            return self.obj_recon.get(), self.losses.get(), iter
+
+    failed_gpus = 0
     def gpu_worker_loop(gpu_id):
-        worker = GPUWorker(gpu_id)
-        while True:
-            item = read_queue.get()
-            if item is None:
-                break
-            idx, img, frame_n = item
-            obj_recon, losses_arr, n_iter = worker.deconvolve(idx, cp.array(img))
-            mip = create_projection_image(obj_recon, 
-                                          text=str(frame_n), 
-                                          vmin=vmin,vmax=vmax,
-                                          absolute_limits=absolute_limits) if write_mip_video else None
-            write_queue.put((idx, obj_recon, losses_arr, n_iter))
-            if write_mip_video:
-                video_writer_queue.put((idx, mip))
-            prev_volume_manager.update(obj_recon, idx)
-            read_queue.task_done()
+        worker = GPUWorker(gpu_id, fully_batched=fully_batched)
+        try:
+            while not stop_event.is_set():
+                item = read_queue.get()
+                if item is None:
+                    break
+                idx, img, frame_n = item
+                if not worker.fully_batched:
+                    obj_recon, losses_arr, n_iter = worker.deconvolve(idx, cp.array(img))
+                else:
+                    try:
+                        obj_recon, losses_arr, n_iter = worker.deconvolve_batch(idx, cp.array(img))
+                    except cp.cuda.memory.OutOfMemoryError:
+                        print(f"GPU{gpu_id} ran out of memory, switching to nonbatched deconvolution")
+                        worker.fully_batched = False
+                        worker.init_memory()
+                        obj_recon, losses_arr, n_iter = worker.deconvolve(idx, cp.array(img))
+                write_queue.put((idx, obj_recon, losses_arr, n_iter))
+                if write_mip_video:
+                    mip = create_projection_image(obj_recon, 
+                                                text=str(frame_n), 
+                                                vmin=vmin,vmax=vmax,
+                                                scalebar=500, zpos=zpos,
+                                                absolute_limits=absolute_limits)
+                    video_writer_queue.put((idx, mip))
+                prev_volume_manager.update(obj_recon, idx)
+                read_queue.task_done()
+        except Exception as e:
+            print(f"Error in GPU worker {gpu_id}: \n{traceback.format_exc()}")
+            nonlocal failed_gpus
+            failed_gpus += 1
+            if failed_gpus == n_gpus:
+                print("all GPU workers failed, stopping all workers.")
+                stop_event.set()
+                # Clear the read queue
+                try: [read_queue.get_nowait() for _ in range(read_queue.qsize())] 
+                except queue.Empty: pass
+            else:
+                print(f"Putting frame {idx} back to read queue")
+                read_queue.put((idx, img, frame_n))
+                
 
     gpu_threads = []
     for gpu_id in range(n_gpus):
@@ -301,12 +431,12 @@ def reconstruct_vols_from_imgs_parallel(paths,
     # Stop the IO thread
     stop_event.set()
     write_queue.put(None)
-    reader_thread.join()
-    writer_thread.join()
+    reader_thread.join(timeout=60)
+    writer_thread.join(timeout=300)
     if write_mip_video:
         video_writer_queue.put(None)
-        video_writer_thread.join()
-    print("Deconvolution finished") if verbose else None
+        video_writer_thread.join(timeout=60)
+    print(f"Deconvolution finished in {time.time()-start_time}") if verbose else None
 
     kwargs = dict(max_iter=max_iter,
                   xy_pad=xy_pad,
@@ -602,7 +732,7 @@ def reconstruct_vol_from_img(img,
             obj_recon[z, :, :] = temp[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size]
 
         if plot:
-            plot_mip[it,:,:] = create_projection_image(obj_recon,pad=pad)
+            plot_mip[it,:,:] = create_projection_image(obj_recon,pad=pad).get()
 
         ratio_ = ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad]
         calc_loss = cp.mean(cp.abs(cp.log(ratio_[ratio_>0])))
@@ -713,23 +843,23 @@ def reconstruct_vol_from_img1(img,
 
     for it in tqdm(range(max_iter)):
         img_est.fill(0)
-        # temp_obj.fill(0)
+        temp_obj.fill(0)
 
-        # temp_obj[:,size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[:, :, :]
-        # img_est = cp.clip(cp.real(ifft2(OTF * fft2(temp_obj), axes=(1,2)), axes=(1,2)), 0, None).sum(axis=0)
+        temp_obj[:,size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[:, :, :]
+        img_est = cp.clip(cp.real(ifft2(OTF * fft2(temp_obj), axes=(1,2)), axes=(1,2)), 0, None).sum(axis=0)
 
-        for z in range(size_z):
-            temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
-            img_est += cp.maximum(cp.real(ifft2(OTF[z, :, :] * fft2(temp_obj))), 0)
+        # for z in range(size_z):
+        #     temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
+        #     img_est += cp.maximum(cp.real(ifft2(OTF[z, :, :] * fft2(temp_obj))), 0)
         ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad] = img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] / (
                     img_est[xy_pad:-xy_pad, xy_pad:-xy_pad] + cp.finfo(cp.float32).eps)
-        # temp_obj[:,size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[:, :, :]
-        # temp_obj *= cp.clip(cp.real(ifft2(fft2(ratio_img) * cp.conj(OTF), axes=(1,2))), 0, None)
-        # obj_recon[:, :, :] = temp_obj[:, size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size]
-        for z in range(size_z):
-            temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
-            temp = temp_obj * (cp.maximum(cp.real(ifft2(fft2(ratio_img) * cp.conj(OTF[z, :, :]))), 0))
-            obj_recon[z, :, :] = temp[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size]
+        temp_obj[:,size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[:, :, :]
+        temp_obj *= cp.clip(cp.real(ifft2(fft2(ratio_img) * cp.conj(OTF), axes=(1,2))), 0, None)
+        obj_recon[:, :, :] = temp_obj[:, size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size]
+        # for z in range(size_z):
+        #     temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
+        #     temp = temp_obj * (cp.maximum(cp.real(ifft2(fft2(ratio_img) * cp.conj(OTF[z, :, :]))), 0))
+        #     obj_recon[z, :, :] = temp[size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size]
 
         if plot:
             plot_mip[it,:,:] = create_projection_image(obj_recon,pad=pad)

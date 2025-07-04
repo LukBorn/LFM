@@ -123,11 +123,7 @@ class SlowProgressLogger:
             eta = (self.total - self.current) / items_per_sec if items_per_sec > 0 else 0
             
             print(f"{self.description}: {self.current}/{self.total} ({self.current/self.total*100:.1f}%) "
-                  f"- {items_per_sec:.2f} it/s - ETA: {eta/60:.1f}m")
+                  f"- {items_per_sec:.2f} it/s - {time.strftime("%H:%M:%S", time.gmtime(eta))} remaining")
                   
             self.last_update_time = current_time
             
-    def finish(self):
-        elapsed = time.time() - self.start_time
-        print(f"{self.description} completed in {elapsed/60:.1f} minutes "
-              f"({self.current/elapsed:.2f} items/sec)")

@@ -134,3 +134,49 @@ def generate_random_gaussians_3d(shape,
         volume += gaussian
 
     return volume
+
+    
+def calculate_running_mean(data, chunk_size=None, dtype=cp.float64):
+    """
+    Calculate mean along axis 0 using chunks to avoid memory issues.
+    
+    Args:
+        data: h5py dataset or array-like with shape (n_frames, height, width)
+        chunk_size: Number of frames to process at once. If None, auto-determine
+        dtype: Data type for accumulation
+    
+    Returns:
+        mean_array: Mean along axis 0 as numpy array
+    """
+    shape = data.shape
+    n_frames = shape[0]
+    
+    # Auto-determine chunk size if not provided (aim for ~500MB per chunk)
+    if chunk_size is None:
+        bytes_per_frame = np.prod(shape[1:]) * 4  # assuming float32
+        target_bytes = 500 * 1024**2  # 500MB
+        chunk_size = max(1, min(n_frames, target_bytes // bytes_per_frame))
+    
+    print(f"Processing {n_frames} frames in chunks of {chunk_size}")
+    
+    # Initialize accumulator on CPU to avoid GPU memory issues
+    running_sum = np.zeros(shape[1:], dtype=np.float64)
+    
+    for i in tqdm(range(0, n_frames, chunk_size), desc="Calculating running mean"):
+        end_idx = min(i + chunk_size, n_frames)
+        
+        # Load chunk and convert to GPU
+        chunk = cp.asarray(data[i:end_idx], dtype=dtype)
+        
+        # Sum along first axis and accumulate on CPU
+        chunk_sum = cp.sum(chunk, axis=0).get()
+        running_sum += chunk_sum
+        
+        # Clean up GPU memory
+        del chunk, chunk_sum
+        cp.get_default_memory_pool().free_all_blocks()
+    
+    # Calculate final mean
+    mean_array = running_sum / n_frames
+    
+    return mean_array.astype(np.float32)

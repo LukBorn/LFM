@@ -9,6 +9,9 @@ import h5py
 import skimage
 import json
 import IPython
+import threading
+import queue
+import time
 
 class AVWriter:
     """ Write video file using av library
@@ -87,7 +90,7 @@ class AVWriter2:
     def __init__(self, filename, width=None, height=None,
                  codec='libx264', fps=25, bit_rate=1000000,
                  pix_fmt='yuv420p', out_fmt='gray', template=None,
-                 expected_indices=None):
+                 expected_indeces=None, verbose=False,):
         filename = os.path.expanduser(filename)
         self.filename = filename
         self.codec = codec
@@ -99,24 +102,50 @@ class AVWriter2:
         self.width = width
         self.height = height
 
+        self.verbose = verbose
+
         self._frame_buffer = {}
-        self._frame_condition = threading.Condition()
-        self._expected_indices = list(expected_indices) if expected_indices is not None else None
+        self._expected_indeces = list(expected_indeces) if expected_indeces is not None else None
         self._written_indices = set()
         self._closed = False
-        self._writing = False
-        self._exception = None
+        if self._expected_indeces is None or len(self._expected_indeces) == 0:
+            raise ValueError("expected_indices must be specified and non-empty for AVWriter2")
         self._thread = threading.Thread(target=self._writer_thread, daemon=True)
         self._thread.start()
 
+    def checkframe(self, im, idx=None):
+        # Frame validation and adjustment (pad, dtype, etc.)
+        if not isinstance(im, np.ndarray):
+            raise ValueError(f"Frame is not a numpy array: {type(im)}")
+        if im.dtype != np.uint8:
+            Warning(f"Frame dtype is not uint8: {im.dtype}, converting to uint8.")
+            im = im.astype(np.uint8)
+        if self.out_fmt == 'gray':
+            if im.ndim != 2:
+                raise ValueError(f"Frame for 'gray' must be 2D, got shape {im.shape}")
+        elif self.out_fmt == 'rgb24':
+            if not (im.ndim == 3 and im.shape[2] == 3):
+                raise ValueError(f"Frame for 'rgb24' must be 3D (H,W,3), got shape {im.shape}")
+        # Pad to even dimensions if needed for yuv420p
+        if self.pix_fmt == 'yuv420p':
+            h, w = im.shape[:2]
+            pad_h = h % 2
+            pad_w = w % 2
+            if pad_h or pad_w:
+                pad_shape = ((0, pad_h), (0, pad_w)) if im.ndim == 2 else ((0, pad_h), (0, pad_w), (0, 0))
+                im = np.pad(im, pad_shape, mode='edge')
+                if self.verbose:
+                    print(f"AVWriter2: Padding frame idx={idx} from ({h},{w}) to ({h+pad_h},{w+pad_w}) for codec compatibility.")
+        return im
+
     def write(self, im, idx):
-        with self._frame_condition:
-            if self._closed:
-                raise RuntimeError("Cannot write to closed AVWriter")
-            if self.width is None or self.height is None:
-                self.height, self.width = im.shape[:2]
-            self._frame_buffer[idx] = im.copy()
-            self._frame_condition.notify_all()
+        if self._closed:
+            raise RuntimeError("Cannot write to closed AVWriter")
+        im = self.checkframe(im, idx)
+        if self.width is None or self.height is None:
+            self.height, self.width = im.shape[:2]
+        # Just put every frame in the buffer, unlimited size
+        self._frame_buffer[idx] = im
 
     def _init_writer(self):
         self.container = av.open(self.filename, mode='w')
@@ -130,59 +159,56 @@ class AVWriter2:
 
     def _writer_thread(self):
         try:
-            if self._expected_indices is None:
-                raise ValueError("expected_indices must be specified for AVWriter2")
-            indices_iter = iter(self._expected_indices)
-            while True:
-                with self._frame_condition:
-                    try:
-                        next_idx = next(indices_iter)
-                    except StopIteration:
+            for next_idx in self._expected_indeces:
+                # Wait until the next expected frame is in the buffer
+                while not self._closed:
+                    if next_idx in self._frame_buffer:
+                        im = self._frame_buffer.pop(next_idx)
                         break
-                    while next_idx not in self._frame_buffer:
-                        if self._closed:
-                            # Wait for the frame to show up, unless closed and no more frames will come
-                            if next_idx not in self._frame_buffer:
-                                self._frame_condition.wait(timeout=0.1)
-                                continue
-                        else:
-                            self._frame_condition.wait()
-                    im = self._frame_buffer.pop(next_idx)
+                    time.sleep(0.01)
+                else:
+                    break
                 if not hasattr(self, "container"):
                     self._init_writer()
+                if self.verbose:
+                    print(f"AVWriter2: Writing frame idx={next_idx}, shape={im.shape}, dtype={im.dtype}, min={im.min()}, max={im.max()}")
                 out_frame = av.VideoFrame.from_ndarray(im, format=self.out_fmt)
                 for packet in self.stream.encode(out_frame):
                     self.container.mux(packet)
                 del out_frame
                 self._written_indices.add(next_idx)
+                del im
         except Exception as e:
-            self._exception = e
+            print(f"AVWriter2: Exception in writer thread: {e}")
         finally:
             if hasattr(self, "stream"):
                 try:
                     for packet in self.stream.encode():
                         self.container.mux(packet)
                 except Exception as e:
-                    print(f"AVWriter: Error during stream.encode() in close(): {e}")
+                    print(f"AVWriter2: Error during stream.encode() in close(): {e}")
             if hasattr(self, "container"):
                 try:
                     self.container.close()
                 except Exception as e:
-                    print(f"AVWriter: Error during container.close(): {e}")
+                    print(f"AVWriter2: Error during container.close(): {e}")
 
     def close(self):
-        try:
-            with self._frame_condition:
-                self._closed = True
-                self._frame_condition.notify_all()
+        self._closed = True
+        if hasattr(self, '_thread'):
             self._thread.join()
-            if self._exception:
-                raise self._exception
-        except Exception as e:
-            print(f"AVWriter: Exception in close: {e}")
+        if self._expected_indeces is not None:
+            missing = set(self._expected_indeces) - self._written_indices
+            if missing and self.verbose:
+                print(f"AVWriter2 WARNING: The following frame indices were expected but not written: {sorted(missing)}")
+            elif self.verbose:
+                print("AVWriter2: All expected frames were written.")
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
         
 
     def __enter__(self):

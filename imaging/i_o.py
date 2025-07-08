@@ -8,6 +8,8 @@ from functools import partial
 import os, pathlib, socket, glob
 import threading, queue
 from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
+import cupy as cp
 
 class Paths():
     def __init__(self, 
@@ -114,7 +116,7 @@ def lazychain(fcn_list, it):
     return out
 
 
-class volume_reader:
+class VolumeReader:
     """Iterable. Reads one volume at a time from HDF5 file (with prefetch)
 
     Args:
@@ -123,34 +125,63 @@ class volume_reader:
         i_frames (iterable): list of frames to include
     """
 
-    def __init__(self, fn, key, i_frames=None, prefetch=1):
-        fn = expandhome(fn)
+    def __init__(self, fn, key, i_frames=None, prefetch=1, verbose=True):
+        self.fn = expandhome(fn)
+        self.key = key
         if i_frames is None:
-            with h5py.File(fn, 'r') as f_in:
+            with h5py.File(self.fn, 'r') as f_in:
                 i_frames = range(len(f_in[key]))
-        self.len = len(i_frames)
+        self.i_frames = list(i_frames)
+        self.len = len(self.i_frames)
+        self.generator = partial(self.volume_reader_gen, self.fn, self.key, self.i_frames)
+        
         self.prefetch = prefetch
-        self.generator = partial(self.volume_reader_gen, fn, key, i_frames)
-        self._queue = queue.Queue(maxsize=prefetch)
+        if self.prefetch < 1:
+            self.start_prefetch()
+        self.verbose = verbose
+        self._update_every = 10
+        self._read_count = 0
+        self._closed = False
+    
+    def start_prefetch(self):
+        self._queue = queue.Queue(maxsize=self.prefetch)
         self._stop_event = threading.Event()
-        self._prefetch_thread = threading.Thread(target=self._prefetch_worker, args=(fn, key, i_frames), daemon=True)
+        self._prefetch_thread = threading.Thread(target=self._prefetch_worker, args=(self.fn, self.key, self.i_frames), daemon=True)
         self._prefetch_thread.start()
 
     def _prefetch_worker(self, fn, key, i_frames):
-        with h5py.File(fn, 'r', swmr=True) as f_in:
+        with h5py.File(fn, 'r') as f_in:
             for i in i_frames:
                 if self._stop_event.is_set():
                     break
                 vol = f_in[key][i]
                 self._queue.put((i, vol))
-            self._queue.put(None)  # Sentinel to signal end
+            if self.verbose:
+                print(f"Finished reading {len(i_frames)} frames")
+            for i in range(self.prefetch):
+                self._queue.put(None)  # Sentinel to signal end
 
-    def get_next_prefetched(self, timeout=60):
+    def get_next_prefetched(self):
+        return next(self.generator(), None)
+
+    def get_next_prefetched_old(self, timeout=60):
         """
         Thread-safe: Get the next available prefetched (idx, volume) tuple.
-        Blocks if none are ready. Returns None when finished.
+        Blocks if none are ready. Returns None when finished or if the queue closed.
         """
+        if self.prefetch==0:
+            if self.verbose:
+                print("Reader: prefetch is disabled, using generator directly.")
+            return next(self.generator(), None)
+        if self._closed:
+            if self.verbose:
+                print("Reader: attempted to get from closed reader, returning None.")
+            return None
         item = self._queue.get(timeout=timeout)
+        if item is not None:
+            self._read_count += 1
+            if self.verbose and (self._read_count % self._update_every == 0 or self._read_count == 1):
+                print(f"Reader: {self._read_count}/{self.len}")
         return item
     
     def put_back(self, item):
@@ -160,10 +191,31 @@ class volume_reader:
         """
         self._queue.put(item)
 
-    def stop_prefetch(self):
+    def close(self, force=False):
+        """Close the volume reader and stop the prefetch thread.
+        If force=True, terminate immediately without waiting for the queue to empty."""
+        self._closed = True
         self._stop_event.set()
-        if self._prefetch_thread.is_alive():
-            self._prefetch_thread.join()
+        if force:
+            # Set stop event and clear the queue as quickly as possible
+            try:
+                while not self._queue.empty():
+                    self._queue.get_nowait()
+            except Exception as e:
+                if self.verbose:
+                    print(f"Error clearing queue: {e}")
+                pass
+        else:
+            self._queue.put_nowait(None)
+        if self._prefetch_thread.is_alive() and threading.current_thread() != self._prefetch_thread:
+            try:
+                self._prefetch_thread.join(timeout=1)
+            except Exception as e:
+                if self.verbose:
+                    print(f"VolumeReader: Error joining prefetch thread: {e}")
+                pass
+        if self.verbose:
+            print(f"Reader closed.")
 
     def __len__(self):
         return self.len
@@ -171,15 +223,19 @@ class volume_reader:
     def __iter__(self):
         return self.generator()
     
-    def get_shape(key):
+    def __del__(self):
+        self.close()
+    
+    def get_shape(self, key=None):
         """Get the shape of the dataset in the HDF5 file."""
+        key = key or self.key
         with h5py.File(self.fn, 'r') as f_in:
             return f_in[key].shape  
 
     @staticmethod
-    def volume_reader_gen(fn, key, i_frames):
-        with h5py.File(fn, 'r', swmr=True) as f_in:
-            lzy_read = lazymap(lambda i: (i, f_in[key][i]), i_frames, 1)
+    def volume_reader_gen(fn, key, i_frames, prefetch):
+        with h5py.File(fn, 'r') as f_in:
+            lzy_read = lazymap(lambda i: (i, f_in[key][i]), i_frames, prefetch=prefetch)
             for item in lzy_read:
                 yield item
  
@@ -195,7 +251,7 @@ def expandhome(path):
 
 
 class AsyncH5Writer:
-    def __init__(self, filepath):
+    def __init__(self, filepath, verbose=False):
         self.filepath = filepath
         self._write_queue = queue.Queue()
         self._stop_event = threading.Event()
@@ -203,6 +259,7 @@ class AsyncH5Writer:
         self._thread.start()
         self._datasets = {}
         self._lock = threading.Lock()
+        self.verbose = verbose
 
     def create_dataset(self, name, shape, dtype=np.float32, **kwargs):
         with h5py.File(self.filepath, 'a') as f:
@@ -212,8 +269,15 @@ class AsyncH5Writer:
                 dset = f[name]
             with self._lock:
                 self._datasets[name] = dset.shape
+    
+    def write_dataset(self, name, data):
+        """Write a complete dataset to the file."""
+        with h5py.File(self.filepath, 'a') as f:
+            if name not in f:
+                f.create_dataset(name, shape=data.shape, dtype=data.dtype)
+            self._write_queue.put(('data', name, slice(None), np.array(data)))
 
-    def write(self, data, dataset_name, index):
+    def write(self, dataset_name, data, index):
         self._write_queue.put(('data', dataset_name, index, np.array(data)))
 
     def write_meta(self, group_name, meta_dict):
@@ -233,6 +297,8 @@ class AsyncH5Writer:
                             raise KeyError(f"Dataset {dataset_name} does not exist. Create it first.")
                         f[dataset_name][index] = data
                         f[dataset_name].flush()
+                        if self.verbose:
+                            print(f"Written data of shape {data.shape} to dataset {dataset_name} at index {index}")
                     elif req[0] == 'meta':
                         _, group_name, meta_dict = req
                         self._write_dict_to_group(f, group_name, meta_dict)
@@ -268,3 +334,112 @@ class AsyncH5Writer:
         self._stop_event.set()
         self._write_queue.join()
         self._thread.join()
+
+
+class InitVolumeManager:
+    def __init__(self, size_z, roi_size, reuse_prev_vol):
+        self.lock = threading.Lock()
+        self.volume = cp.ones((size_z, 2 * roi_size, 2 * roi_size), dtype=cp.float32)
+        self.index= -1
+        self.reuse_prev_vol = reuse_prev_vol
+    
+    def update(self, volume, idx):
+        if self.reuse_prev_vol:
+            if idx > self.index:
+                with self.lock:
+                    self.volume = volume
+                    self.index = idx
+
+    def get(self):   
+        with self.lock:
+            return self.volume
+
+def get_available_gpus(verbose= True):
+    """Robustly detect available GPUs with comprehensive error handling"""
+    try:
+         # Reset CUDA context before detection
+        try:
+            cp.cuda.runtime.deviceReset()
+            # Add a small delay to let GPU reset
+            import time
+            time.sleep(1)
+        except:
+            pass
+        
+        # Force synchronization
+        try:
+            cp.cuda.runtime.deviceSynchronize()
+        except:
+            pass
+        
+        # Set environment variables for better GPU handling
+        os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+        os.environ['CUDA_VISIBLE_DEVICES'] = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+        
+        # First check if CUDA is available at all
+        print("Checking CUDA availability...") if verbose else None
+        
+        # Method 1: Check nvidia-smi
+        import subprocess
+        try:
+            result = subprocess.run(['nvidia-smi', '-L'], 
+                                  capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                gpu_lines = [line for line in result.stdout.split('\n') if 'GPU' in line]
+                nvidia_gpu_count = len(gpu_lines)
+                print(f"nvidia-smi reports {nvidia_gpu_count} GPUs") if verbose else None
+            else:
+                nvidia_gpu_count = 0
+                print(f"nvidia-smi failed with return code {result.returncode}") if verbose else None
+        except Exception as e:
+            nvidia_gpu_count = 0
+            print(f"nvidia-smi check failed: {e}") if verbose else None
+        
+        # Method 2: Try to initialize CUDA context
+        try:
+            print("Attempting CUDA context initialization...") if verbose else None
+            
+            # Try to reset any existing context
+            try:
+                cp.cuda.runtime.deviceReset()
+            except:
+                pass
+            
+            # Set CUDA device order
+            os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+            
+            # Try to get device count
+            cupy_gpu_count = cp.cuda.runtime.getDeviceCount()
+            print(f"CuPy reports {cupy_gpu_count} GPUs") if verbose else None
+            
+            # Test each GPU
+            working_gpus = []
+            for i in range(cupy_gpu_count):
+                try:
+                    with cp.cuda.Device(i):
+                        # Try a simple operation
+                        test_array = cp.ones(10, dtype=cp.float32)
+                        result = test_array.sum()
+                        print(f"GPU {i}: Working (test sum: {result})") if verbose else None
+                        working_gpus.append(i)
+                except Exception as e:
+                    print(f"GPU {i}: Failed - {e}") 
+            
+            cupy_gpu_count = len(working_gpus)
+            
+        except Exception as e:
+            print(f"CuPy GPU detection failed: {e}")
+            cupy_gpu_count = 0
+        
+        # Use the minimum of both methods
+        n_gpus = min(nvidia_gpu_count, cupy_gpu_count) if nvidia_gpu_count > 0 and cupy_gpu_count > 0 else max(nvidia_gpu_count, cupy_gpu_count)
+        
+        if n_gpus == 0:
+            raise RuntimeError("No GPUs detected or accessible")
+        
+        print(f"Using {n_gpus} GPU(s)") if verbose else None
+        return n_gpus
+        
+    except Exception as e:
+        print(f"GPU detection completely failed: {e}")
+        return 1  # Fallback

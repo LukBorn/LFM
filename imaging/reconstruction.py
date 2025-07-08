@@ -9,9 +9,9 @@ import tempfile
 from daio.h5 import lazyh5
 import os, pathlib, socket, glob, traceback
 import threading, queue, time
-from video import AVWriter, create_projection_image
+from video import AVWriter, create_projection_image, AVWriter2
 from slurm import SlowProgressLogger
-from i_o import AsyncH5Writer, volume_reader
+from i_o import AsyncH5Writer, VolumeReader, InitVolumeManager, get_available_gpus
 
 
 def get_OTF(paths,
@@ -70,25 +70,6 @@ def get_OTF(paths,
 
 
 
-class PrevVolumeManager:
-    def __init__(self, size_z, roi_size, reuse_prev_vol):
-        self.lock = threading.Lock()
-        self.volume = cp.ones((size_z, 2 * roi_size, 2 * roi_size), dtype=cp.float32)
-        self.index= -1
-        self.reuse_prev_vol = reuse_prev_vol
-    
-    def update(self, volume, idx):
-        if self.reuse_prev_vol:
-            if idx > self.index:
-                with self.lock:
-                    self.volume = volume
-                    self.index = idx
-
-    def get(self):   
-        with self.lock:
-            return self.volume
-
-
 def reconstruct_vols_from_imgs_parallel2(paths,
                                         img_idx=None,
                                         max_iter=30,
@@ -108,7 +89,7 @@ def reconstruct_vols_from_imgs_parallel2(paths,
                                         vmax=100,
                                         absolute_limits=False,
                                         force_new=False,
-                                        verbose=True,
+                                        verbose=1,
                                         ):
     """
     Reconstructs volumes from images using the Richardson-Lucy algorithm.
@@ -148,7 +129,7 @@ def reconstruct_vols_from_imgs_parallel2(paths,
 
     force_new (bool): Whether to overwrite existing files.
 
-    verbose (bool): Whether to print progress messages.
+    verbose (bool): 1 for basic progress messages, 2 for detailed progress messages.
     
 
     Reading and writing are seperated into seperate threads, so that reading, writing and deconvolution can happen in parallel
@@ -181,16 +162,16 @@ def reconstruct_vols_from_imgs_parallel2(paths,
         raise ValueError("no background file specified")
 
 
-    print("Setting up I/O queues") if verbose else None
+    print("Setting up I/O queues") if verbose >= 1 else None
     #determine the read indexes
-    with h5py.File(paths.raw, 'r') as f:
-        if img_idx is None:
+    if img_idx is None:
+        with h5py.File(paths.raw, 'r') as f:
             img_idx = (0, f["data"].shape[0], 1)
-            save_fn = paths.deconvolved
-        else:
-            assert len(img_idx) == 3, "img_idx must be a tuple of (start, stop, step)"
-            read_idx = range(img_idx[0], img_idx[1], img_idx[2])
-            save_fn = paths.deconvolved[:-3]+ f"_frames{img_idx[0]}-{img_idx[1]}.h5"
+        save_fn = paths.deconvolved
+    else:
+        assert len(img_idx) == 3, "img_idx must be a tuple of (start, stop, step)"
+        save_fn = paths.deconvolved[:-3]+ f"_frames{img_idx[0]}-{img_idx[1]}.h5"
+    read_idx = range(img_idx[0], img_idx[1], img_idx[2])
 
 
     # handle existing files
@@ -209,8 +190,8 @@ def reconstruct_vols_from_imgs_parallel2(paths,
                     )
             if param_match:
                 processed_indices = f['processed_indices'][:]
-                print(f"Resuming from existing file. {len(processed_indices)}/{n_img} volumes already processed.") if verbose else None
                 read_idx = [i for i in read_idx if i not in processed_indices]
+                print(f"Resuming from existing file. {len(processed_indices)}/{len(read_idx)} volumes already processed.") if verbose else None
 
             else:
                 print("Parameters do not match, overwriting existing file.") if verbose else None
@@ -224,13 +205,13 @@ def reconstruct_vols_from_imgs_parallel2(paths,
     else:
         print(f"Writing into new file: {save_fn}") if verbose else None
 
-    n_gpus = get_available_gpus()
+    n_gpus = get_available_gpus(verbose= (verbose >= 2))
     stop_event = threading.Event()
 
-    # set up reading queue
-    reader = volume_reader(paths.raw, 'data', i_frames=read_idx, prefetch=2*n_gpus+1)
+    # set IO workers
+    reader = VolumeReader(paths.raw, 'data', i_frames=read_idx, prefetch=2*n_gpus, verbose=(verbose >= 2))
 
-    writer = AsyncH5Writer(save_fn)
+    writer = AsyncH5Writer(save_fn, verbose=(verbose >= 2))
     writer.write_meta('deconvolution_params', {'OTF': otf_path,
                                                 'roi_size': roi_size,
                                                 'max_iter': max_iter,
@@ -250,21 +231,18 @@ def reconstruct_vols_from_imgs_parallel2(paths,
     writer.create_dataset('data', shape=(reader.len, size_z, 2 * roi_size, 2 * roi_size), dtype=np.float32)
     writer.create_dataset('losses', shape=(reader.len, max_iter), dtype=np.float32)
     writer.create_dataset('n_iter', shape=(reader.len,), dtype=np.int32)
-    processed_indeces = []
     
     if write_mip_video:
-        fn_vid = paths.deconvolved[:-3] + f"_f{}_mip_vmin{vmin}_vmax{vmax}{"_al" if absolute_limits else ""}.mp4"
-        video_writer = AVWriter2(fn_vid,fps=fps)
+        fn_vid = paths.deconvolved[:-3] + f"_f{"_all" if img_idx is None else img_idx}_mip_vmin{vmin}_vmax{vmax}{"_al" if absolute_limits else ""}.mp4"
+        video_writer = AVWriter2(fn_vid, fps=fps, expected_indeces=read_idx, verbose=(verbose >= 2))
 
-    #setup previous volume manager
-    prev_volume_manager = PrevVolumeManager(size_z, roi_size, reuse_prev_vol)
+    init_volume_manager = InitVolumeManager(size_z, roi_size, reuse_prev_vol)
 
     # Define the GPU worker class
     class GPUWorker:
         def __init__(self, gpu_id, fully_batched=False):
             self.gpu_id = gpu_id
             cp.cuda.Device(gpu_id).use()
-            
             self.OTF = cp.asarray(OTF)
             self.mask = cp.asarray(mask) if img_mask else None
             self.bg = cp.asarray(bg) if img_subtract_bg else None
@@ -273,11 +251,11 @@ def reconstruct_vols_from_imgs_parallel2(paths,
 
         def init_memory(self):
             if not self.fully_batched:
-                print(f"GPU {self.gpu_id}: Initializing Memory") if verbose else None
+                print(f"GPU {self.gpu_id}: Initializing Memory") if verbose >= 1 else None
                 self.temp_obj = cp.zeros((size_y, size_x), dtype=cp.float32)                
                 self.temp = cp.zeros((size_y, size_x), dtype=cp.float32)
             else:
-                print(f"GPU {self.gpu_id}: Initializing Memory for fully batched deconvolution") if verbose else None
+                print(f"GPU {self.gpu_id}: Initializing Memory for fully batched deconvolution") if verbose >= 1 else None
                 self.temp_obj = cp.zeros((size_z, size_y, size_x), dtype=cp.float32)
             self.img_est = cp.zeros((size_y, size_x), dtype=cp.float32)
             self.ratio_img = cp.zeros((size_y, size_x), dtype=cp.float32)
@@ -289,9 +267,9 @@ def reconstruct_vols_from_imgs_parallel2(paths,
             if img_mask: img *= self.mask
             self.img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
 
-            self.obj_recon = cp.asarray(prev_volume_manager.get()).copy()
+            self.obj_recon = cp.asarray(init_volume_manager.get()).copy()
 
-            loop = tqdm(range(max_iter), desc=f"GPU {self.gpu_id}: Deconvolving image {it+1}/{n_img}", leave=False) if verbose else range(max_iter)
+            loop = tqdm(range(max_iter), desc=f"GPU {self.gpu_id}: Deconvolving image {it+1}/{reader.len}", leave=False) if verbose >= 1 else range(max_iter)
 
             for iter in loop:
                 self.img_est.fill(0)
@@ -319,8 +297,7 @@ def reconstruct_vols_from_imgs_parallel2(paths,
                 loss = cp.mean(cp.abs(cp.log(ratio_[ratio_>0])))
                 self.losses[iter] = loss
                 if loss < loss_threshold:
-                    break      
-                
+                    break    
             return self.obj_recon.get(), self.losses.get(), iter
         
         def deconvolve_batch(self, it, img):
@@ -328,9 +305,9 @@ def reconstruct_vols_from_imgs_parallel2(paths,
             if img_mask: img *= self.mask
             self.img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
 
-            self.obj_recon = cp.asarray(prev_volume_manager.get()).copy()
+            self.obj_recon = cp.asarray(init_volume_manager.get()).copy()
 
-            loop = tqdm(range(max_iter), desc=f"GPU {self.gpu_id}: Deconvolving image {it+1}/{reader.len}", leave=False) if verbose else range(max_iter)
+            loop = tqdm(range(max_iter), desc=f"GPU {self.gpu_id}: Deconvolving image {it+1}/{reader.len}", leave=False) if verbose >= 1 else range(max_iter)
 
             for iter in loop:
                 self.img_est.fill(0)
@@ -354,7 +331,9 @@ def reconstruct_vols_from_imgs_parallel2(paths,
             return self.obj_recon.get(), self.losses.get(), iter
 
     # Define the GPU worker loop
+    _failed= False
     failed_gpus = 0
+    processed_indeces = []
     def gpu_worker_loop(gpu_id):
         worker = GPUWorker(gpu_id, fully_batched=fully_batched)
         try:
@@ -363,16 +342,17 @@ def reconstruct_vols_from_imgs_parallel2(paths,
                 if item is None:
                     break
                 frame_n, img = item
+                print(f"GPU {gpu_id}: Processing frame {frame_n+1}/{reader.len} with shape {img.shape}") if verbose >= 2 else None
                 if not worker.fully_batched:
-                    obj_recon, losses_arr, n_iter = worker.deconvolve(frame_n, cp.array(img))
+                    obj_recon, losses_arr, n_iter = worker.deconvolve(frame_n, cp.asarray(img))
                 else:
                     try:
-                        obj_recon, losses_arr, n_iter = worker.deconvolve_batch(idx, cp.array(img))
+                        obj_recon, losses_arr, n_iter = worker.deconvolve_batch(frame_n, cp.asarray(img))
                     except cp.cuda.memory.OutOfMemoryError:
-                        print(f"GPU{gpu_id} ran out of memory, switching to nonbatched deconvolution")
+                        print(f"GPU {gpu_id} ran out of memory, switching to nonbatched deconvolution") if verbose >= 1 else None
                         worker.fully_batched = False
                         worker.init_memory()
-                        obj_recon, losses_arr, n_iter = worker.deconvolve(idx, cp.array(img))
+                        obj_recon, losses_arr, n_iter = worker.deconvolve(frame_n, cp.asarray(img))
                 writer.write('data', obj_recon, frame_n)
                 writer.write('losses', losses_arr, frame_n)
                 writer.write('n_iter', n_iter, frame_n)
@@ -383,16 +363,19 @@ def reconstruct_vols_from_imgs_parallel2(paths,
                                                 scalebar=200, zpos=zpos,
                                                 text_size=1,
                                                 absolute_limits=absolute_limits)
-                    video_writer.write(mip)
-                prev_volume_manager.update(obj_recon, idx)
+                    video_writer.write(mip, frame_n)
+                init_volume_manager.update(obj_recon, frame_n)
+                processed_indeces.append(frame_n)
         except Exception as e:
             print(f"Error in GPU worker {gpu_id}: \n{traceback.format_exc()}")
             nonlocal failed_gpus
             failed_gpus += 1
             if failed_gpus == n_gpus:
-                print("all GPU workers failed, stopping all workers.")
+                print("all GPU workers failed, stopping all workers.") if verbose >= 1 else None
+                nonlocal _failed
+                _failed = True
             else:
-                print(f"Putting frame {idx} back to read queue")
+                print(f"Putting frame {frame_n} back to read queue") if verbose >= 1 else None
                 reader.put_back((frame_n, img))
                 
     # Start GPU worker threads
@@ -406,11 +389,12 @@ def reconstruct_vols_from_imgs_parallel2(paths,
     for t in gpu_threads:
         t.join()
     stop_event.set()
-    reader.close()
+    reader.close(force = _failed)
+    writer.write_dataset('processed_indices', np.array(processed_indeces, dtype=np.int32))
     writer.close()
     if write_mip_video:
         video_writer.close()
-    print(f"Deconvolution finished in {time.strftime("%H:%M:%S", time.gmtime(time.time()-start_time))}") if verbose else None
+    print(f"Deconvolution finished in {time.strftime("%H:%M:%S", time.gmtime(time.time()-start_time))}") if verbose >=1 else None
 
     kwargs = dict(max_iter=max_iter,
                   xy_pad=xy_pad,
@@ -1057,96 +1041,3 @@ def reconstruct_vols_from_imgs(paths,
 
     return objs, plots_mip, losses, kwargs
 
-def get_available_gpus():
-    """Robustly detect available GPUs with comprehensive error handling"""
-    try:
-         # Reset CUDA context before detection
-        try:
-            cp.cuda.runtime.deviceReset()
-            # Add a small delay to let GPU reset
-            import time
-            time.sleep(1)
-        except:
-            pass
-        
-        # Force synchronization
-        try:
-            cp.cuda.runtime.deviceSynchronize()
-        except:
-            pass
-        
-        # Set environment variables for better GPU handling
-        os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-        os.environ['CUDA_VISIBLE_DEVICES'] = os.environ.get('CUDA_VISIBLE_DEVICES', '')
-        
-        # First check if CUDA is available at all
-        print("Checking CUDA availability...")
-        
-        # Method 1: Check nvidia-smi
-        import subprocess
-        try:
-            result = subprocess.run(['nvidia-smi', '-L'], 
-                                  capture_output=True, text=True, timeout=10)
-            if result.returncode == 0:
-                gpu_lines = [line for line in result.stdout.split('\n') if 'GPU' in line]
-                nvidia_gpu_count = len(gpu_lines)
-                print(f"nvidia-smi reports {nvidia_gpu_count} GPUs")
-            else:
-                nvidia_gpu_count = 0
-                print(f"nvidia-smi failed with return code {result.returncode}")
-        except Exception as e:
-            nvidia_gpu_count = 0
-            print(f"nvidia-smi check failed: {e}")
-        
-        # Method 2: Try to initialize CUDA context
-        try:
-            print("Attempting CUDA context initialization...")
-            
-            # Try to reset any existing context
-            try:
-                cp.cuda.runtime.deviceReset()
-            except:
-                pass
-            
-            # Set CUDA device order
-            os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-            
-            # Try to get device count
-            cupy_gpu_count = cp.cuda.runtime.getDeviceCount()
-            print(f"CuPy reports {cupy_gpu_count} GPUs")
-            
-            # Test each GPU
-            working_gpus = []
-            for i in range(cupy_gpu_count):
-                try:
-                    with cp.cuda.Device(i):
-                        # Try a simple operation
-                        test_array = cp.ones(10, dtype=cp.float32)
-                        result = test_array.sum()
-                        print(f"GPU {i}: Working (test sum: {result})")
-                        working_gpus.append(i)
-                except Exception as e:
-                    print(f"GPU {i}: Failed - {e}")
-            
-            cupy_gpu_count = len(working_gpus)
-            
-        except Exception as e:
-            print(f"CuPy GPU detection failed: {e}")
-            cupy_gpu_count = 0
-        
-        # Use the minimum of both methods
-        n_gpus = min(nvidia_gpu_count, cupy_gpu_count) if nvidia_gpu_count > 0 and cupy_gpu_count > 0 else max(nvidia_gpu_count, cupy_gpu_count)
-        
-        if n_gpus == 0:
-            print("No working GPUs detected. Available options:")
-            print("1. Run on CPU (not recommended)")
-            print("2. Check SLURM GPU allocation")
-            print("3. Contact system administrator")
-            raise RuntimeError("No GPUs detected or accessible")
-        
-        print(f"Using {n_gpus} GPU(s)")
-        return n_gpus
-        
-    except Exception as e:
-        print(f"GPU detection completely failed: {e}")
-        return 1  # Fallback

@@ -4,7 +4,7 @@ import h5py
 import json
 from tqdm.auto import tqdm
 from video import AVWriter, create_projection_image, AVWriter2
-from i_o import volume_reader
+from i_o import VolumeReader
 
 
 
@@ -26,19 +26,19 @@ def reference_volume(paths,
     with h5py.File(paths.deconvolved, 'r') as f:
         zpos = np.array(f['zpos'])
 
-    reader = volume_reader(paths.deconvolved, key='data', i_frames=idx)
+    reader = VolumeReader(paths.deconvolved, key='data', i_frames=idx)
     averager = Averager(shape=reader.get_shape('data')[1:])
     video_fn = paths.pn_outrec+ f'/reference_f{ref_idx}.mp4'
     video_writer=AVWriter2(video_fn,
                            fps = int(json.load(open(paths.meta))["acquisition"]["fps"]if fps is None else fps),
-                           expected_indices=idx,)
+                           expected_indeces=idx,)
     for frame_n, im in tqdm(reader, desc="Averaging"):
         data = preprocess(im, **kwargs)
         averager.step(data)
         mip = create_projection_image(data,
                                       vmax=vmax, vmin=vmin, absolute_limits=absolute_limits,
-                                      zpos=zpos, scalebar = 200, text=f"f{i}",)
-        video_writer.write(mip)
+                                      zpos=zpos, scalebar = 200, text=f"f{frame_n}",)
+        video_writer.write(mip, frame_n)
     ref_vol = averager.retrieve()
     video_writer.close()
     return ref_vol, video_fn

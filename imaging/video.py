@@ -12,6 +12,7 @@ import IPython
 import threading
 import queue
 import time
+from i_o import VolumeReader
 
 class AVWriter:
     """ Write video file using av library
@@ -294,7 +295,7 @@ def create_projection_image(volume,
 
     output = get_clipped_array(output, vmin=vmin, vmax=vmax, absolute_limits=absolute_limits).get()
 
-    color = 240 if not absolute_limits else int(0.95*vmax)
+    color = 240 if not absolute_limits else int(vmax)
     if text is not None:
         font, lineType = cv2.FONT_HERSHEY_PLAIN, text_size+1
         text_width, text_height = cv2.getTextSize(text, font, text_size, lineType)[0]
@@ -368,20 +369,33 @@ def recording_to_video(paths,
         print(f"Video file {fn_vid} already exists. Skipping video creation.")
         return fn_vid
     
-    with h5py.File(paths.deconvolved, "r") as f:
-        video_writer = None
-        for i in tqdm(range(f["data"].shape[0]), desc="Creating video"):
-            vol = f["data"][i]
-            mip = create_projection_image(vol, projection="max", 
-                                          vmin=vmin, vmax=vmax, 
-                                          absolute_limits=absolute_limits,
-                                          text=str(i))
-            if video_writer is None:
-                height, width = mip.shape
-                video_writer = AVWriter(fn_vid, height=height, width=width,
-                                        codec = "mpeg4", fps=int(fps), 
-                                        pix_fmt='yuv420p', out_fmt='gray')
-            video_writer.write(mip.astype(np.uint8))
+    try:
+        with h5py.File(paths.deconvolved, "r") as f:
+            zpos = np.array(f['zpos'])
+    except KeyError:
+        zpos = None
+    if fps is None:
+        try:
+            with open(paths.meta, 'r') as f:
+                meta = json.load(f)
+            fps = meta["acquisition"]["fps"]
+        except Exception as e:
+            print(f"Error reading fps from metadata: {e}, set fps to 10")
+            fps = 10
+
+    
+    reader = VolumeReader(paths.deconvolved, key='data', prefetch=3)
+
+    video_writer = AVWriter2(fn_vid, fps=fps, expected_indeces=range(0, reader.len),)
+
+    for frame_n, im in tqdm(reader, desc="Creating video"):
+        mip = create_projection_image(im, projection="max", 
+                                      vmin=vmin, vmax=vmax, 
+                                      absolute_limits=absolute_limits, 
+                                      zpos = zpos,
+                                      text=str(frame_n))
+        video_writer.write(mip.astype(np.uint8), frame_n)
+
     video_writer.close()
     return fn_vid
 
@@ -390,43 +404,15 @@ def array3d_to_video(array,
                    fps=10, 
                    vmin=0, vmax=100, absolute_limits=False,
                    ):
-    """
-    Save a 3D array to a video file using the AVWriter class.
-
-    Parameters:
-    -----------
-    array : np.ndarray or cp.ndarray
-        3D array of shape (frames, height, width).
-    filename : str
-        Full path of the output video file.
-    fps : int
-        Frames per second for the video. Default is 10.
-    vmin : float
-        Minimum value for clipping. Default is 0.
-    vmax : float
-        Maximum value for clipping. Default is 100.
-    absolute_limits : bool
-        Whether to use absolute limits for clipping. Default is False.
-    codec : str
-        Codec for the video. Default is 'h264'.
-    bit_rate : int
-        Bit rate for the video. Default is 1000000.
-    pix_fmt : str
-        Pixel format for the video. Default is 'yuv420p'.
-    out_fmt : str
-        Output format for the video frames. Default is 'rgb24'.
-    """
-    
-    writer = AVWriter(filename, width=array.shape[2], height=array.shape[1],
-                      codec='h264', fps=int(fps), bit_rate=2 * 8e6,
-                      pix_fmt='yuv420p', out_fmt='gray')
+        
+    video_writer = AVWriter2(filename, fps =fps, expected_indeces=range(0, array.shape[0]),)
     
     for i in tqdm(range(array.shape[0]), desc="Creating video"):
         frame = array[i]
-        frame = get_clipped_array(frame, vmin=vmin, vmax=vmax, absolute_limits=absolute_limits)
-        writer.write(frame)
+        frame = get_clipped_array(frame, vmin=vmin, vmax=vmax, absolute_limits=absolute_limits).get()
+        video_writer.write(frame, i)
     
-    writer.close()
+    video_writer.close()
     return filename
 
 def array4d_to_mip_video(array, 
@@ -434,18 +420,14 @@ def array4d_to_mip_video(array,
                         fps=10, 
                         vmin=0, vmax=100, absolute_limits=False,
                         ):
-    writer = None
+    video_writer = video_writer = AVWriter2(filename, fps =5, expected_indeces=range(0, array.shape[0]),)
     
     for i in tqdm(range(array.shape[0]), desc="Creating video"):
         data = array[i]
         frame = create_projection_image(data,vmin=vmin, absolute_limits=absolute_limits,text=f"f{i}",)
-        if writer is None:
-            writer = AVWriter(filename, width=frame.shape[1], height=frame.shape[0],
-                      codec='h264', fps=int(fps), bit_rate=2 * 8e6,
-                      pix_fmt='yuv420p', out_fmt='gray')
-        writer.write(frame)
+        video_writer.write(frame, i)
     
-    writer.close()
+    video_writer.close()
     return filename
 
 def recording_to_overlay_preview(paths,

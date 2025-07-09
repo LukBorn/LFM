@@ -21,7 +21,7 @@ def get_OTF(paths,
             xy_pad=201,
             verbose=True
             ):
-    otf_path = os.path.join(paths.pn_scratch + f"/OTF_{paths.psf_name}_pad{xy_pad}{"_clip" if OTF_clip else ""}{"_norm" if OTF_normalize else ""}{f'_dwn{psf_downsample}' if psf_downsample is not None else ''}.npy")
+    otf_path = os.path.join(paths.pn_otfs + f"/OTF_{paths.psf_name}_pad{xy_pad}{"_clip" if OTF_clip else ""}{"_norm" if OTF_normalize else ""}{f'_dwn{psf_downsample}' if psf_downsample is not None else ''}.npy")
     if psf_downsample is None:
         psf_downsample = [0, None, 1]
     if os.path.exists(otf_path):
@@ -85,6 +85,7 @@ def reconstruct_vols_from_imgs_parallel2(paths,
                                         img_mask=True,
                                         fully_batched=False,
                                         write_mip_video=True,
+                                        out_crop=None,
                                         vmin=0,
                                         vmax=100,
                                         absolute_limits=False,
@@ -149,6 +150,9 @@ def reconstruct_vols_from_imgs_parallel2(paths,
                                                                         )
     
     crop = _crop if crop is None else crop
+
+    if out_crop is None:
+        out_crop = 0, 2 * roi_size, 0, 2 * roi_size
 
     fps = json.load(open(paths.meta))["acquisition"]["fps"]
     led_pwr = json.load(open(paths.meta))["acquisition"]["led_percent"]
@@ -224,13 +228,15 @@ def reconstruct_vols_from_imgs_parallel2(paths,
                                                 'OTF_normalize': OTF_normalize,
                                                 'OTF_clip': OTF_clip,
                                                 'crop': crop,
+                                                'out_crop': out_crop,
                                                 'vmin': vmin,
                                                 'vmax': vmax,
                                                 'absolute_limits': absolute_limits
                                                 })
-    writer.create_dataset('data', shape=(reader.len, size_z, 2 * roi_size, 2 * roi_size), dtype=np.float32)
+    writer.create_dataset('data', shape=(reader.len, size_z, out_crop[1]-out_crop[0], out_crop[3]-out_crop[2]), dtype=np.float32)
     writer.create_dataset('losses', shape=(reader.len, max_iter), dtype=np.float32)
     writer.create_dataset('n_iter', shape=(reader.len,), dtype=np.int32)
+    writer.write_dataset('zpos', zpos)
     
     if write_mip_video:
         fn_vid = paths.deconvolved[:-3] + f"_f{"_all" if img_idx is None else img_idx}_mip_vmin{vmin}_vmax{vmax}{"_al" if absolute_limits else ""}.mp4"
@@ -338,7 +344,7 @@ def reconstruct_vols_from_imgs_parallel2(paths,
         worker = GPUWorker(gpu_id, fully_batched=fully_batched)
         try:
             while not stop_event.is_set():
-                item = reader.get_next_prefetched(timeout=60)
+                item = reader.get_next()
                 if item is None:
                     break
                 frame_n, img = item
@@ -353,7 +359,7 @@ def reconstruct_vols_from_imgs_parallel2(paths,
                         worker.fully_batched = False
                         worker.init_memory()
                         obj_recon, losses_arr, n_iter = worker.deconvolve(frame_n, cp.asarray(img))
-                writer.write('data', obj_recon, frame_n)
+                writer.write('data', obj_recon[:,out_crop[0]:out_crop[1],out_crop[2]:out_crop[3]], frame_n)
                 writer.write('losses', losses_arr, frame_n)
                 writer.write('n_iter', n_iter, frame_n)
                 if write_mip_video:
@@ -721,7 +727,7 @@ def reconstruct_vols_from_imgs_parallel(paths,
         video_writer_thread.start()
     
     #setup previous volume manager
-    prev_volume_manager = PrevVolumeManager(size_z, roi_size, reuse_prev_vol)
+    prev_volume_manager = InitVolumeManager(size_z, roi_size, reuse_prev_vol)
 
     # Define the GPU worker class
     class GPUWorker:
@@ -1009,7 +1015,7 @@ def reconstruct_vols_from_imgs(paths,
             
             if plot_decon:
                 plots_mip[it, iter,:,:] = create_projection_image(obj_recon, 
-                                                                text=str(frame_n), 
+                                                                text=f"{frame_n}, {iter}", 
                                                                 vmin=vmin, vmax=vmax,absolute_limits=absolute_limits,
                                                                 scalebar=200, zpos=zpos,text_size=3,)
 

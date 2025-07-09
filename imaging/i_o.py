@@ -38,6 +38,7 @@ class Paths():
         self.pn_scratch = expand(pathlib.Path(scratch, dataset_name))
         self.psf_name = psf_name
         self.pn_psfs = expand(pathlib.Path(pn_psfs))
+        self.pn_otfs = expand(pathlib.Path(pn_psfs, 'otfs'))
         self.pn_psf = expand(pathlib.Path(self.pn_psfs, psf_name))
         self.pn_bg = expand(pathlib.Path(pn_bg))
         
@@ -116,7 +117,7 @@ def lazychain(fcn_list, it):
     return out
 
 
-class VolumeReader:
+class VolumeReader:    
     """Iterable. Reads one volume at a time from HDF5 file (with prefetch)
 
     Args:
@@ -125,7 +126,7 @@ class VolumeReader:
         i_frames (iterable): list of frames to include
     """
 
-    def __init__(self, fn, key, i_frames=None, prefetch=1, verbose=True):
+    def __init__(self, fn, key, i_frames=None, prefetch=1):
         self.fn = expandhome(fn)
         self.key = key
         if i_frames is None:
@@ -133,98 +134,35 @@ class VolumeReader:
                 i_frames = range(len(f_in[key]))
         self.i_frames = list(i_frames)
         self.len = len(self.i_frames)
-        self.generator = partial(self.volume_reader_gen, self.fn, self.key, self.i_frames)
-        
         self.prefetch = prefetch
-        if self.prefetch < 1:
-            self.start_prefetch()
-        self.verbose = verbose
-        self._update_every = 10
-        self._read_count = 0
-        self._closed = False
-    
-    def start_prefetch(self):
-        self._queue = queue.Queue(maxsize=self.prefetch)
-        self._stop_event = threading.Event()
-        self._prefetch_thread = threading.Thread(target=self._prefetch_worker, args=(self.fn, self.key, self.i_frames), daemon=True)
-        self._prefetch_thread.start()
+        self._lock = threading.Lock()
+        self._gen = self.volume_reader_gen(self.fn, self.key, self.i_frames, self.prefetch)
 
-    def _prefetch_worker(self, fn, key, i_frames):
-        with h5py.File(fn, 'r') as f_in:
-            for i in i_frames:
-                if self._stop_event.is_set():
-                    break
-                vol = f_in[key][i]
-                self._queue.put((i, vol))
-            if self.verbose:
-                print(f"Finished reading {len(i_frames)} frames")
-            for i in range(self.prefetch):
-                self._queue.put(None)  # Sentinel to signal end
-
-    def get_next_prefetched(self):
-        return next(self.generator(), None)
-
-    def get_next_prefetched_old(self, timeout=60):
-        """
-        Thread-safe: Get the next available prefetched (idx, volume) tuple.
-        Blocks if none are ready. Returns None when finished or if the queue closed.
-        """
-        if self.prefetch==0:
-            if self.verbose:
-                print("Reader: prefetch is disabled, using generator directly.")
-            return next(self.generator(), None)
-        if self._closed:
-            if self.verbose:
-                print("Reader: attempted to get from closed reader, returning None.")
-            return None
-        item = self._queue.get(timeout=timeout)
-        if item is not None:
-            self._read_count += 1
-            if self.verbose and (self._read_count % self._update_every == 0 or self._read_count == 1):
-                print(f"Reader: {self._read_count}/{self.len}")
-        return item
-    
-    def put_back(self, item):
-        """
-        Put an item (idx, volume) back into the prefetch queue.
-        Useful if a worker cannot process an item and wants to return it for another worker.
-        """
-        self._queue.put(item)
-
-    def close(self, force=False):
-        """Close the volume reader and stop the prefetch thread.
-        If force=True, terminate immediately without waiting for the queue to empty."""
-        self._closed = True
-        self._stop_event.set()
-        if force:
-            # Set stop event and clear the queue as quickly as possible
-            try:
-                while not self._queue.empty():
-                    self._queue.get_nowait()
-            except Exception as e:
-                if self.verbose:
-                    print(f"Error clearing queue: {e}")
-                pass
-        else:
-            self._queue.put_nowait(None)
-        if self._prefetch_thread.is_alive() and threading.current_thread() != self._prefetch_thread:
-            try:
-                self._prefetch_thread.join(timeout=1)
-            except Exception as e:
-                if self.verbose:
-                    print(f"VolumeReader: Error joining prefetch thread: {e}")
-                pass
-        if self.verbose:
-            print(f"Reader closed.")
+    def get_next(self):
+        """Thread-safe: Get the next item from the generator."""
+        with self._lock:
+            return next(self._gen)
+        
+    def __next__(self):
+        return self.get_next()
 
     def __len__(self):
         return self.len
 
     def __iter__(self):
-        return self.generator()
+        return self
     
     def __del__(self):
-        self.close()
+        # Attempt to clean up generator and lock references to help GC and avoid tqdm issues
+        try:
+            if hasattr(self, '_gen'):
+                self._gen = None
+            if hasattr(self, '_lock'):
+                self._lock = None
+        except Exception:
+            pass
+        # Optionally, print for debug
+        # print(f"VolumeReader __del__ called for {self}")
     
     def get_shape(self, key=None):
         """Get the shape of the dataset in the HDF5 file."""
@@ -234,6 +172,7 @@ class VolumeReader:
 
     @staticmethod
     def volume_reader_gen(fn, key, i_frames, prefetch):
+        # Debug print to help diagnose argument issues
         with h5py.File(fn, 'r') as f_in:
             lzy_read = lazymap(lambda i: (i, f_in[key][i]), i_frames, prefetch=prefetch)
             for item in lzy_read:

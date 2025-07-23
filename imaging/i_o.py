@@ -7,9 +7,10 @@ import sys
 from functools import partial
 import os, pathlib, socket, glob
 import threading, queue
-from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import cupy as cp
+from concurrent.futures import ThreadPoolExecutor
+
 
 class Paths():
     def __init__(self, 
@@ -54,7 +55,7 @@ class Paths():
         self.raw = os.path.join(self.pn_rec, 'data.h5')
         self.deconvolved = os.path.join(self.pn_outrec, 'deconvolved.h5')
         self.registered = os.path.join(self.pn_outrec, 'registered.h5')
-        self.reg_recipe = os.path.join(self.pn_outrec, 'reg_recipe.json')
+        self.reg_recipe = os.path.join(self.pn_outrec, 'reg_recipe.h5')
 
         #URLs
         self.url_home = url_home
@@ -126,9 +127,10 @@ class VolumeReader:
         i_frames (iterable): list of frames to include
     """
 
-    def __init__(self, fn, key, i_frames=None, prefetch=1):
+    def __init__(self, fn, key="data", i_frames=None, prefetch=1, verbose=False):
         self.fn = expandhome(fn)
         self.key = key
+        self.verbose = verbose
         if i_frames is None:
             with h5py.File(self.fn, 'r') as f_in:
                 i_frames = range(len(f_in[key]))
@@ -136,15 +138,30 @@ class VolumeReader:
         self.len = len(self.i_frames)
         self.prefetch = prefetch
         self._lock = threading.Lock()
-        self._gen = self.volume_reader_gen(self.fn, self.key, self.i_frames, self.prefetch)
+        self._gen = self.volume_reader_gen(self.fn, self.key, self.i_frames, self.prefetch, self.verbose)
+        self.finished = False  
 
     def get_next(self):
-        """Thread-safe: Get the next item from the generator."""
+        """Thread-safe: Get the next item from the generator, returns None after exhaustion."""
         with self._lock:
-            return next(self._gen)
-        
+            if self.finished:
+                return None
+            try:
+                return next(self._gen)
+            except StopIteration:
+                self.finished = True
+                return None
+
     def __next__(self):
-        return self.get_next()
+        with self._lock:
+            if self.finished:
+                raise StopIteration
+            try:
+                item = next(self._gen)
+                return item
+            except StopIteration:
+                self.finished = True
+                raise StopIteration
 
     def __len__(self):
         return self.len
@@ -161,8 +178,7 @@ class VolumeReader:
                 self._lock = None
         except Exception:
             pass
-        # Optionally, print for debug
-        # print(f"VolumeReader __del__ called for {self}")
+
     
     def get_shape(self, key=None):
         """Get the shape of the dataset in the HDF5 file."""
@@ -171,15 +187,17 @@ class VolumeReader:
             return f_in[key].shape  
 
     @staticmethod
-    def volume_reader_gen(fn, key, i_frames, prefetch):
+    def volume_reader_gen(fn, key, i_frames, prefetch, verbose):
         # Debug print to help diagnose argument issues
         with h5py.File(fn, 'r') as f_in:
             lzy_read = lazymap(lambda i: (i, f_in[key][i]), i_frames, prefetch=prefetch)
             for item in lzy_read:
+                if verbose:
+                    print("Reader: Reading item", item[0])  # Debug 
+                    if isinstance(item, tuple) and len(item) == 2:
+                        print("Reader: Item data shape", item[1].shape)  # Debug
                 yield item
  
-
-
 
 
 
@@ -212,9 +230,18 @@ class AsyncH5Writer:
     def write_dataset(self, name, data):
         """Write a complete dataset to the file."""
         with h5py.File(self.filepath, 'a') as f:
-            if name not in f:
-                f.create_dataset(name, shape=data.shape, dtype=data.dtype)
-            self._write_queue.put(('data', name, slice(None), np.array(data)))
+            if isinstance(data, (str, bytes)):
+                # Use string dtype for HDF5
+                dt = h5py.string_dtype(encoding='utf-8') if isinstance(data, str) else 'S'
+                if name not in f:
+                    f.create_dataset(name, data=data, dtype=dt)
+                else:
+                    f[name][...] = data
+                self._write_queue.put(('data', name, slice(None), np.array(data)))
+            else:
+                if name not in f:
+                    f.create_dataset(name, shape=data.shape, dtype=data.dtype)
+                self._write_queue.put(('data', name, slice(None), np.array(data)))
 
     def write(self, dataset_name, data, index):
         self._write_queue.put(('data', dataset_name, index, np.array(data)))
@@ -243,7 +270,10 @@ class AsyncH5Writer:
                         self._write_dict_to_group(f, group_name, meta_dict)
                     f.flush()
                 except Exception as e:
+                    import traceback
                     print(f"AsyncH5Writer error: {e}")
+                    print("Traceback:")
+                    traceback.print_exc()
                 self._write_queue.task_done()
 
     def _write_dict_to_group(self, f, group_name, d):
@@ -256,7 +286,13 @@ class AsyncH5Writer:
                         subg = g[k]
                     recursive_write(subg, v)
                 else:
-                    g.attrs[k] = v
+                    # Write as dataset instead of attribute
+                    if k in g:
+                        del g[k]
+                    # Convert to numpy if possible for consistency
+                    if isinstance(v, (list, tuple)):
+                        v = np.array(v)
+                    g.create_dataset(k, data=v)
         if group_name not in f:
             g = f.create_group(group_name)
         else:

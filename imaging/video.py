@@ -195,6 +195,19 @@ class AVWriter2:
                     print(f"AVWriter2: Error during container.close(): {e}")
 
     def close(self):
+        # Wait until all expected frames are present in the buffer before closing
+        if self._expected_indeces is not None:
+            wait_count = 0
+            while True:
+                # Wait until all expected frames are either written or present in the buffer
+                remaining = set(self._expected_indeces) - (set(self._frame_buffer.keys()) | self._written_indices)
+                if not remaining:
+                    break
+                time.sleep(0.01)
+                wait_count += 1
+                # Optional: warn if waiting too long
+                if self.verbose and wait_count % 500 == 0:
+                    print(f"AVWriter2: Waiting for {len(remaining)} frames to be written...")
         self._closed = True
         if hasattr(self, '_thread'):
             self._thread.join()
@@ -228,7 +241,8 @@ def create_projection_image(volume,
                             text=None,
                             text_size=3,
                             scalebar=200, 
-                            zpos=None,):
+                            zpos=None,
+                            transpose=False):
     """
     Creates a 2D image showing projections of a 3D volume along all three axes.
 
@@ -263,6 +277,8 @@ def create_projection_image(volume,
         - yz on the right side
     """
     volume = cp.asarray(volume)
+    if transpose:
+        volume = cp.transpose(volume, (0, 2, 1))  # Transpose to (depth, width, height)
     # Get dimensions
     depth, height, width = volume.shape
 
@@ -295,7 +311,7 @@ def create_projection_image(volume,
 
     output = get_clipped_array(output, vmin=vmin, vmax=vmax, absolute_limits=absolute_limits).get()
 
-    color = 240 if not absolute_limits else int(vmax)
+    color = 240 
     if text is not None:
         font, lineType = cv2.FONT_HERSHEY_PLAIN, text_size+1
         text_width, text_height = cv2.getTextSize(text, font, text_size, lineType)[0]
@@ -335,8 +351,21 @@ def create_projection_image(volume,
 
     return output
 
+def get_clipped_array(arr, vmin=0, vmax=100, absolute_limits=False):
+    arr = cp.asarray(arr)
+    if not absolute_limits:
+        # Normalize to percentiles (linear interpolation between min and max)
+        arr_min = arr.min()
+        arr_max = arr.max()
+        vmin = arr_min + vmin/100 * (arr_max - arr_min)
+        vmax = arr_min + vmax/100 * (arr_max - arr_min)
+    # When absolute_limits=True, use vmin and vmax as provided
+    return (cp.clip((arr - vmin)/(vmax-vmin),0,1) * 255).astype(cp.uint8)
+
+
 
 def recording_to_video(paths,
+                       dff=False, alpha = 0.1,
                        fps=10, 
                        vmin=0, vmax=100, absolute_limits=False
                        ):
@@ -363,7 +392,7 @@ def recording_to_video(paths,
         Template codec context to use for the stream. Default is None.
     """
 
-    fn_vid = paths.deconvolved[:-3] + f"_mip_vmin{vmin}_vmax{vmax}{"_al" if absolute_limits else ""}.mp4"
+    fn_vid = paths.deconvolved[:-3] + f'{"_dff" if dff else ""}_mip_vmin{vmin}_vmax{vmax}{"_al" if absolute_limits else ""}.mp4'
     
     if os.path.exists(fn_vid):
         print(f"Video file {fn_vid} already exists. Skipping video creation.")
@@ -388,8 +417,16 @@ def recording_to_video(paths,
 
     video_writer = AVWriter2(fn_vid, fps=fps, expected_indeces=range(0, reader.len),)
 
-    for frame_n, im in tqdm(reader, desc="Creating video"):
-        mip = create_projection_image(im, projection="max", 
+    if dff:
+        running_avg = cp.ones(reader.get_shape("data")[1:], dtype=cp.float32)  
+
+    for frame_n, vol in tqdm(reader, desc="Creating video"):
+        if dff:
+            vol = cp.asarray(vol).clip(1, None)
+            running_avg = alpha* vol + (1 - alpha) * running_avg 
+            vol = (vol - running_avg) / vol
+
+        mip = create_projection_image(vol, projection="max", 
                                       vmin=vmin, vmax=vmax, 
                                       absolute_limits=absolute_limits, 
                                       zpos = zpos,
@@ -399,13 +436,15 @@ def recording_to_video(paths,
     video_writer.close()
     return fn_vid
 
+
 def array3d_to_video(array,
                    filename,
                    fps=10, 
                    vmin=0, vmax=100, absolute_limits=False,
+                   verbose=False
                    ):
         
-    video_writer = AVWriter2(filename, fps =fps, expected_indeces=range(0, array.shape[0]),)
+    video_writer = AVWriter2(filename, fps =fps, expected_indeces=range(0, array.shape[0]),verbose=verbose)
     
     for i in tqdm(range(array.shape[0]), desc="Creating video"):
         frame = array[i]
@@ -420,7 +459,7 @@ def array4d_to_mip_video(array,
                         fps=10, 
                         vmin=0, vmax=100, absolute_limits=False,
                         ):
-    video_writer = video_writer = AVWriter2(filename, fps =5, expected_indeces=range(0, array.shape[0]),)
+    video_writer = video_writer = AVWriter2(filename, fps =fps, expected_indeces=range(0, array.shape[0]),)
     
     for i in tqdm(range(array.shape[0]), desc="Creating video"):
         data = array[i]
@@ -454,8 +493,8 @@ def recording_to_overlay_preview(paths,
     # define all the filenames and wether to read/write
     fn_overlays = os.path.join(paths.pn_outrec,"overlay_previews")
     os.makedirs(fn_overlays, exist_ok=True)
-    fn_vid = fn_overlays + f"/overlay{"_clip"+str(min_clip) if min_clip!=0 else""}{"_norm" if normalize else ""}_preview_{fps}fps_{vmin}vmin_{vmax}vmax{"_al" if absolute_limits else ""}.mp4" 
-    fn_file = fn_overlays + f"/overlay{"_clip"+str(min_clip) if min_clip!=0 else""}{"_norm" if normalize else ""}.h5"
+    fn_vid = fn_overlays + f'/overlay{"_clip"+str(min_clip) if min_clip!=0 else""}{"_norm" if normalize else ""}_preview_{fps}fps_{vmin}vmin_{vmax}vmax{"_al" if absolute_limits else ""}.mp4'
+    fn_file = fn_overlays + f'/overlay{"_clip"+str(min_clip) if min_clip!=0 else""}{"_norm" if normalize else ""}.h5'
     read_file = False
     read_dff_file = False
     if os.path.exists(fn_vid):
@@ -591,16 +630,6 @@ def img_to_overlay_preview(img,cx,cy,masks,padxy,mean=True):
         sub_img /= np.array(cx).shape[0]
     return sub_img
 
-def get_clipped_array(arr, vmin=0, vmax=100, absolute_limits=False):
-    arr = cp.asarray(arr)
-    if not absolute_limits:
-        # Normalize to percentiles (linear interpolation between min and max)
-        arr_min = arr.min()
-        arr_max = arr.max()
-        vmin = arr_min + vmin/100 * (arr_max - arr_min)
-        vmax = arr_min + vmax/100 * (arr_max - arr_min)
-    # When absolute_limits=True, use vmin and vmax as provided
-    return (cp.clip((arr - vmin)/(vmax-vmin),0,1) * 255).astype(cp.uint8)
 
 def showvid(filename, width=600, embed=False, loop=True):
     """
@@ -620,3 +649,7 @@ def showvid(filename, width=600, embed=False, loop=True):
 
     html_attributes = "controls loop" if loop else "controls"
     display(Video(filename, embed=embed, width=width, html_attributes=html_attributes))
+
+
+
+

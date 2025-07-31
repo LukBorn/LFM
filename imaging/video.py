@@ -234,6 +234,7 @@ class AVWriter2:
 
 def create_projection_image(volume, 
                             projection="max", 
+                            slice_idx=None,
                             vmin=0,
                             vmax=100,
                             absolute_limits=False,
@@ -242,7 +243,8 @@ def create_projection_image(volume,
                             text_size=3,
                             scalebar=200, 
                             zpos=None,
-                            transpose=False):
+                            transpose=False,
+                            gpu=True):
     """
     Creates a 2D image showing projections of a 3D volume along all three axes.
 
@@ -276,7 +278,9 @@ def create_projection_image(volume,
         - xz at the bottom
         - yz on the right side
     """
-    volume = cp.asarray(volume)
+    if isinstance(volume, cp.ndarray) and not gpu:
+        volume = volume.get()
+    volume = cp.asarray(volume) if gpu else volume
     if transpose:
         volume = cp.transpose(volume, (0, 2, 1))  # Transpose to (depth, width, height)
     # Get dimensions
@@ -288,14 +292,19 @@ def create_projection_image(volume,
     # Calculate output dimensions with padding
     output_height = height + depth + 3 * pad
     output_width = width + depth + 3 * pad
-    output = cp.zeros((output_height, output_width), dtype=volume.dtype)
-    
+    output = cp.zeros((output_height, output_width), dtype=volume.dtype) if gpu else np.zeros((output_height, output_width), dtype=volume.dtype)
+
     if projection == "max":
-        projection_func = cp.max
+        projection_func = cp.max if gpu else np.max
     elif projection == "mean":
-        projection_func = cp.mean
+        projection_func = cp.mean if gpu else np.mean
     elif projection == "sum":
-        projection_func = cp.sum
+        projection_func = cp.sum if gpu else np.sum
+    elif projection == "slice":
+        if slice_idx is None:
+            slice_idx = [depth // 2, height // 2, width // 2]
+        def projection_func(vol, axis):
+            return vol[slice_idx[0], :, :] if axis == 0 else vol[:, slice_idx[1], :] if axis == 1 else vol[:, :, slice_idx[2]]
     else:
         raise ValueError(f"Unknown projection type: {projection}")
             
@@ -309,7 +318,9 @@ def create_projection_image(volume,
     # YZ projection (right side) 
     output[pad:pad + height, pad + width + pad:pad + width + pad + depth] = projection_func(volume, axis=2).T
 
-    output = get_clipped_array(output, vmin=vmin, vmax=vmax, absolute_limits=absolute_limits).get()
+    output = get_clipped_array(output, vmin=vmin, vmax=vmax, absolute_limits=absolute_limits, gpu=gpu)
+
+    output = output.get() if gpu else output
 
     color = 240 
     if text is not None:
@@ -351,8 +362,11 @@ def create_projection_image(volume,
 
     return output
 
-def get_clipped_array(arr, vmin=0, vmax=100, absolute_limits=False):
-    arr = cp.asarray(arr)
+def get_clipped_array(arr, vmin=0, vmax=100, absolute_limits=False, gpu=True):
+    if gpu:
+        arr = cp.asarray(arr)
+    elif isinstance(arr, cp.ndarray):
+        arr = arr.get()  
     if not absolute_limits:
         # Normalize to percentiles (linear interpolation between min and max)
         arr_min = arr.min()
@@ -360,7 +374,11 @@ def get_clipped_array(arr, vmin=0, vmax=100, absolute_limits=False):
         vmin = arr_min + vmin/100 * (arr_max - arr_min)
         vmax = arr_min + vmax/100 * (arr_max - arr_min)
     # When absolute_limits=True, use vmin and vmax as provided
-    return (cp.clip((arr - vmin)/(vmax-vmin),0,1) * 255).astype(cp.uint8)
+    if gpu:
+        out =(cp.clip((arr - vmin)/(vmax-vmin),0,1) * 255).astype(cp.uint8)
+    else:
+        out =(np.clip((arr - vmin)/(vmax-vmin),0,1) * 255).astype(np.uint8)
+    return out
 
 
 
@@ -444,7 +462,7 @@ def array3d_to_video(array,
                    verbose=False
                    ):
         
-    video_writer = AVWriter2(filename, fps =fps, expected_indeces=range(0, array.shape[0]),verbose=verbose)
+    video_writer = AVWriter2(filename, fps =fps, expected_indeces=range(array.shape[0]),verbose=verbose)
     
     for i in tqdm(range(array.shape[0]), desc="Creating video"):
         frame = array[i]
@@ -640,15 +658,8 @@ def showvid(filename, width=600, embed=False, loop=True):
         embed (bool): Whether to embed the video in the notebook.
         loop (bool): Whether to loop the video.
     """
-    try:
-        from IPython.display import Video, display
-    except ImportError:
-        raise ImportError(
-            "The 'IPython' package is required to display videos. Please install it."
-        )
-
     html_attributes = "controls loop" if loop else "controls"
-    display(Video(filename, embed=embed, width=width, html_attributes=html_attributes))
+    IPython.display.display(IPython.display.Video(filename, embed=embed, width=width, html_attributes=html_attributes))
 
 
 

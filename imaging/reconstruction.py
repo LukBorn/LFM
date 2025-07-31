@@ -9,7 +9,7 @@ import tempfile
 from daio.h5 import lazyh5
 import os, pathlib, socket, glob, traceback
 import threading, queue, time
-from video import AVWriter, create_projection_image, AVWriter2
+from video import create_projection_image, AVWriter2, create_slice_image
 from slurm import SlowProgressLogger
 from i_o import AsyncH5Writer, VolumeReader, InitVolumeManager, get_available_gpus
 
@@ -40,7 +40,7 @@ def get_OTF(paths,
             mask = np.array(f["circle_mask"])[crop[0]:crop[1], crop[2]:crop[3]]
             zpos = np.array(f["z_positions"])
             zpos = zpos[psf_downsample[0]:psf_downsample[1]:psf_downsample[2]] if psf_downsample is not None else zpos
-            psf = cp.array(f["psf"])
+            psf = np.array(f["psf"])
   
         size_y = psf.shape[1] + 2 * xy_pad
         size_x = psf.shape[2] + 2 * xy_pad
@@ -50,8 +50,9 @@ def get_OTF(paths,
             psf_downsample[1] = psf[:psf_downsample[1],:,:].shape[0]
         size_z = len(range(*psf_downsample))
 
+
         #calculate OTF
-        OTF = cp.zeros((size_z, size_y, size_x), dtype=cp.complex64)
+        OTF = np.zeros((size_z, size_y, size_x), dtype=np.complex64)
 
         for i,z in enumerate(tqdm(range(*psf_downsample), desc=f"Calculating OTF: (downsampling PSF by {psf_downsample[2]})")):
             slice_processed = cp.asarray(psf[z,:,:]).astype(cp.float32)
@@ -59,12 +60,12 @@ def get_OTF(paths,
                 slice_processed = cp.clip(slice_processed, 0, None)
             if OTF_normalize:
                 slice_processed /= slice_processed.sum()
-            OTF[i, :, :] = fft2(ifftshift(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')))
+            OTF[i, :, :] = (fft2(ifftshift(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')))).get()
             # OTF[z, :, :] = fft2(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant'))
             # assert slice_processed.sum() = 1, "OTF not normalized"
-        cp.save(otf_path, OTF)
-        OTF = OTF.get()
+        np.save(otf_path, OTF)
         del psf 
+
 
     return OTF, size_z, size_y, size_x, crop, mask, zpos, otf_path
 
@@ -86,6 +87,8 @@ def reconstruct_vols_from_imgs_parallel(paths,
                                         fully_batched=False,
                                         write_mip_video=True,
                                         out_crop=None,
+                                        projection="max",
+                                        slice_idx=None,
                                         vmin=0,
                                         vmax=100,
                                         absolute_limits=False,
@@ -365,17 +368,14 @@ def reconstruct_vols_from_imgs_parallel(paths,
                         worker.fully_batched = False
                         worker.init_memory()
                         obj_recon, losses_arr, n_iter = worker.deconvolve(frame_n, cp.asarray(img))
-                writer.write('data', obj_recon[:,out_crop[0]:out_crop[1],out_crop[2]:out_crop[3]], output_idx)
+                obj_recon = obj_recon[:,out_crop[0]:out_crop[1],out_crop[2]:out_crop[3]]
+                writer.write('data', obj_recon, output_idx)
                 writer.write('losses', losses_arr, output_idx)
                 writer.write('n_iter', n_iter, output_idx)
                 if write_mip_video:
-                    mip = create_projection_image(obj_recon, 
-                                                text=str(frame_n), 
-                                                vmin=vmin,vmax=vmax,
-                                                scalebar=200, zpos=zpos,
-                                                text_size=1,
-                                                absolute_limits=absolute_limits,
-                                                transpose=transpose)
+                    mip = create_projection_image(obj_recon, projection=projection, slice_idx=slice_idx,
+                                                  vmin=vmin, vmax=vmax, absolute_limits=absolute_limits, transpose=transpose,
+                                                  text=f"{frame_n}, {iter}", scalebar=200, zpos=zpos,text_size=3,)
                     video_writer.write(mip, frame_n)
                 init_volume_manager.update(obj_recon, frame_n)
                 processed_indeces.append(frame_n)
@@ -441,8 +441,11 @@ def reconstruct_vols_from_imgs(paths,
                                crop=None,
                                img_subtract_bg=False,
                                img_mask=True,
+                               img_normalize=True,
                                fully_batched=False,
                                plot_decon=True,
+                                   projection="max",
+                                   slice_idx=None,
                                    vmin=0,
                                    vmax=100,
                                    absolute_limits=False,
@@ -483,7 +486,7 @@ def reconstruct_vols_from_imgs(paths,
     plots_mip = np.zeros(shape=(n_img, max_iter, mip_shape, mip_shape), dtype=np.float32)
     losses = np.zeros((n_img, max_iter), dtype=np.float32)
     
-    OTF = cp.asarray(OTF)
+    OTF = np.asarray(OTF)
     mask = cp.asarray(mask) if img_mask else None
     bg = cp.asarray(bg).astype(cp.uint8) if img_subtract_bg else None
     img_est = cp.zeros((size_y, size_x), dtype=cp.float32)
@@ -499,8 +502,10 @@ def reconstruct_vols_from_imgs(paths,
     for it, frame_n in enumerate(tqdm(read_idx, desc="Reconstructing volumes")):
         with h5py.File(paths.raw, 'r') as f:
             img = cp.asarray(f["data"][frame_n, crop[0]:crop[1], crop[2]:crop[3]])
-        if img_subtract_bg: img -= bg
+        if img_subtract_bg: img = img- bg
+        if img_normalize: img /= img.mean()
         if img_mask: img *= mask
+        img = img.clip(1e-6, None)
         img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
         if not reuse_prev_vol:
                 obj_recon.fill(1)
@@ -514,7 +519,8 @@ def reconstruct_vols_from_imgs(paths,
                     temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size,
                              size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
                     # adding the contribution of each slice to the image estimate
-                    img_est += cp.maximum(cp.real(ifft2(OTF[z, :, :] * fft2(temp_obj))), 0)
+                    OTF_z = cp.asarray(OTF[z, :, :])
+                    img_est += cp.maximum(cp.real(ifft2(OTF_z * fft2(temp_obj))), 0)
                 #calculate ratio
                 ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad] = img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] / (
                         img_est[xy_pad:-xy_pad, xy_pad:-xy_pad] + cp.finfo(cp.float32).eps)
@@ -524,7 +530,8 @@ def reconstruct_vols_from_imgs(paths,
                     temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size,
                              size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
                     #updating the object estimate 
-                    temp = temp_obj * (cp.maximum(cp.real(ifft2(fft2(ratio_img) * cp.conj(OTF[z, :, :]))), 0))
+                    OTF_z = cp.asarray(OTF[z, :, :])
+                    temp = temp_obj * (cp.maximum(cp.real(ifft2(fft2(ratio_img) * cp.conj(OTF_z))), 0))
                     obj_recon[z, :, :] = temp[size_y // 2 - roi_size: size_y // 2 + roi_size,
                                               size_x // 2 - roi_size: size_x // 2 + roi_size]
             else:
@@ -537,11 +544,9 @@ def reconstruct_vols_from_imgs(paths,
                 obj_recon[:, :, :] = temp_obj[:, size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size]
             
             if plot_decon:
-                plots_mip[it, iter,:,:] = create_projection_image(obj_recon, 
-                                                                text=f"{frame_n}, {iter}", 
-                                                                vmin=vmin, vmax=vmax,absolute_limits=absolute_limits,
-                                                                scalebar=200, zpos=zpos,text_size=3,
-                                                                transpose=transpose)
+                plots_mip[it, iter,:,:] = create_projection_image(obj_recon, projection=projection, slice_idx=slice_idx,
+                                                                  vmin=vmin, vmax=vmax, absolute_limits=absolute_limits, transpose=transpose,
+                                                                  text=f"{frame_n}, {iter}", scalebar=200, zpos=zpos,text_size=3,)
 
            #calculate loss
             ratio_ = ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad]
@@ -564,7 +569,10 @@ def reconstruct_vols_from_imgs(paths,
                   crop=crop,
                   img_subtract_bg=img_subtract_bg,
                   img_mask=img_mask,
+                  img_normalize=img_normalize,
                   fully_batched=fully_batched,
+                  projection=projection,
+                  slice_idx=slice_idx,
                   vmin=vmin,
                   vmax=vmax,
                   absolute_limits=absolute_limits,
@@ -572,3 +580,8 @@ def reconstruct_vols_from_imgs(paths,
 
     return objs, plots_mip, losses, kwargs
 
+def percentile_normalization(arr, low_percentile=5, high_percentile=95):
+    arr = cp.asarray(arr)
+    p_low = cp.percentile(arr, low_percentile)
+    p_high = cp.percentile(arr, high_percentile)
+    return (arr - p_low) / (p_high - p_low + cp.finfo(cp.float32).eps)

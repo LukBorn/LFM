@@ -11,7 +11,7 @@ import threading
 import time, os
 from skimage.metrics import structural_similarity as ssim
 from cupyx.scipy.ndimage import median_filter, maximum_filter
-
+from signal_extraction import NeighborhoodCovMapper, NeighborhoodCorrMapper
 
 def average_volumes(paths,
                     ref_idx =[100,120,1],
@@ -77,6 +77,13 @@ def mini_registration(paths,
         except Exception as e:
             print(f"Error reading zpos from metadata: {e}, setting zpos to None")
             zpos = None
+    with h5py.File(paths.reg_mask, 'r') as f:
+        try:
+            reg_mask = cp.asarray(f['mask_3d']).transpose(0,2,1)
+        except Exception as e:
+            print(f"Error reading reg_mask from metadata: {e}, setting reg_mask to None")
+            reg_mask = 1.0
+
     reader = VolumeReader(paths.deconvolved, key='data', i_frames=range(*idx))
 
     video_fn = paths.pn_outrec + f'/mini_registration_f{idx}_vmin{vmin}_vmax{vmax}{"_al" if absolute_limits else ""}.mp4'
@@ -102,6 +109,7 @@ def mini_registration(paths,
                                       zpos=zpos, scalebar=200, text=f"f{frame_n}",transpose=transpose)
         video_writer.write(mip, frame_n)
         registered_vol, _warpfield, _ = register_volumes(ref_vol, data, recipe)
+        registered_vol *= reg_mask
         mip_reg = create_projection_image(registered_vol,
                                       vmax=vmax, vmin=vmin, absolute_limits=absolute_limits,
                                       zpos=zpos, scalebar=200, text=f"f{frame_n}",text_size = 2,transpose=transpose)
@@ -140,13 +148,10 @@ def calculate_metrics(ref_vol, mov_vol, verbose=False):
     sigma12 = cp.mean((ref2d - mu1)*(mov2d - mu2))
     ssim_val = ((2*mu1*mu2 + C1)*(2*sigma12 + C2)) / ((mu1**2 + mu2**2 + C1)*(sigma1_sq + sigma2_sq + C2))
     ssim_val = float(ssim_val.get())
-    # Pearson's r (minimal, 1D)
-    ac = ref - ref.mean()
-    bc = reg - reg.mean()
-    r = (ac * bc).mean() / (cp.sqrt((ac**2).mean()) * cp.sqrt((bc**2).mean()))
+
     if verbose:
         print(f"Metrics calculated in {time.time() - t0:.2f} seconds")
-    return float(corr), -float(mse), float(ssim_val), float(r)
+    return float(corr), -float(mse), float(ssim_val)
 
 
 
@@ -158,7 +163,13 @@ def register_recording(paths):
         ref_vol = cp.asarray(f['ref_vol'])
         crop = np.asarray(f['crop'])
         vid_params = json.loads(f['vid_params'][()])
-        eye_mask = cp.asarray(f['eyemask']) if 'eyemask' in f.keys() else None
+    
+    with h5py.File(paths.reg_mask, 'r') as f:
+        try:
+            reg_mask = cp.asarray(f['mask_3d'])
+        except Exception as e:
+            print(f"Error reading reg_mask from metadata: {e}, setting reg_mask to None")
+            reg_mask = 1.0
 
     
     reader = VolumeReader(paths.deconvolved, key='data', i_frames=None)
@@ -174,9 +185,11 @@ def register_recording(paths):
     writer.write_dataset('block_stride', testwarp.block_stride.get())
     writer.write_dataset('ref_vol', ref_vol.get())
     writer.write_meta('recipe', {"path": recipe_yaml_path})
-    writer.create_dataset("metrics", shape=(reader.len, 4), dtype=np.float32)
-    print("metrics")
-
+    writer.create_dataset("metrics", shape=(reader.len, 3), dtype=np.float32)
+    
+    cov_mapper = NeighborhoodCovMapper(tau=recipe.cov_tau)
+    corr_mapper = NeighborhoodCorrMapper(tau=recipe.cov_tau)
+    corr_mapper_2 = NeighborhoodCorrMapper(tau=2)
 
     if vid_params["write_video"]:
         video_fn = paths.pn_outrec + f'/registered{"_T" if vid_params["transpose"] else ""}_vmin{vid_params["vid"]["vmin"]}-vmax{vid_params["vid"]["vmax"]}{"_al" if vid_params["vid"]["absolute_limits"] else ""}.mp4'
@@ -190,15 +203,25 @@ def register_recording(paths):
 
     for frame_n, vol in tqdm(reader, desc="Registering"):
         vol = cp.asarray(vol)[:, crop[0]:crop[1], crop[2]:crop[3]]
-        if eye_mask is not None:
-            vol *= eye_mask
         registered_vol, warpfield, _ = register_volumes(ref_vol, vol, recipe)
-        registered_vol = cp.clip(registered_vol,1,None)
+        registered_vol *= reg_mask
+        
+        writer.write("warpfields", warpfield.warp_field.get(), frame_n)
+        writer.write("data", registered_vol.get(), frame_n)
+        metrics = np.array(calculate_metrics(ref_vol, registered_vol, verbose=False))
+        writer.write("metrics", metrics, frame_n)
+
+        if metrics[0] > recipe.r_threshold:
+            cov_mapper.step(registered_vol)
+            corr_mapper.step(registered_vol)
+            corr_mapper_2.step(registered_vol)
+
         if vid_params["write_video"]:
             mip = create_projection_image(registered_vol, 
                                           vmax=vid_params["vid"]["vmax"], vmin=vid_params["vid"]["vmin"], absolute_limits=vid_params["vid"]["absolute_limits"],
                                           zpos=vid_params["zpos"], scalebar=vid_params["scalebar"], text=f"f{frame_n}",transpose=vid_params["transpose"])
             video_writer.write(mip, frame_n)
+        
         if vid_params["write_dff_video"]:
             average_vol = (1/vid_params["dff"]["tau"]) * registered_vol+ (1-1/vid_params["dff"]["tau"]) * average_vol
             dff_vol = (registered_vol - average_vol) / average_vol
@@ -206,16 +229,20 @@ def register_recording(paths):
                                               vmax=vid_params["dff"]["vmax"], vmin=vid_params["dff"]["vmin"], absolute_limits=vid_params["dff"]["absolute_limits"],
                                               zpos=vid_params["zpos"], scalebar=vid_params["scalebar"], text=f"f{frame_n}",transpose=vid_params["transpose"])
             dff_video_writer.write(dff_mip, frame_n)
-        writer.write("warpfields", warpfield.warp_field.get(), frame_n)
-        writer.write("data", registered_vol.get(), frame_n)
-        metrics = np.array(calculate_metrics(ref_vol, registered_vol, verbose=False))
-        writer.write("metrics", metrics, frame_n)
-    
+    cov_map, var_map = cov_mapper.retrieve()
+    writer.write_dataset('cov_map', cov_map)
+    writer.write_dataset('var_map', var_map)
+    writer.write_dataset('corr_map', corr_mapper.retrieve().get())
+    writer.write_dataset('corr2_map', corr_mapper_2.retrieve().get())
     writer.close()
     if vid_params["write_video"]:
         video_writer.close()
     if vid_params["write_dff_video"]:
         dff_video_writer.close()
+
+
+
+
 
 def registered_volume_reader(paths, idx=None):
     vol_reader = VolumeReader(paths.deconvolved, key='data', i_frames=idx)
@@ -244,6 +271,73 @@ def registered_volume_reader(paths, idx=None):
         warped_vol = warp_field.apply(vol_cp)
         
         yield frame_n, warped_vol.get() 
+
+
+
+def save_register_recipe(paths, recipe, ref_vol, crop, vid_params=None, eye_mask=None, cov_tau=60):
+    recipe_yaml_path = paths.reg_recipe[:-3] + '.yaml'  
+    recipe.to_yaml(recipe_yaml_path)
+    with h5py.File(paths.reg_recipe, 'w') as f:
+        f.create_dataset('recipe_path', data=recipe_yaml_path)
+        f.create_dataset('ref_vol', data=ref_vol)
+        f.create_dataset('cov_tau', data=cov_tau)
+        if crop is None:
+            crop = (0, ref_vol.shape[1], 0, ref_vol.shape[2])
+        f.create_dataset('crop', data=crop)
+        assert ref_vol.shape == (ref_vol.shape[0],crop[1]-crop[0],crop[3]-crop[2]), "crop must be compatible with ref_vol shape"
+        
+        if eye_mask is not None:
+            f.create_dataset("eyemask", data=eye_mask)
+
+        if vid_params is None:
+            vid_params = {
+                "write_video": False,
+                "write_dff_video": False,
+                "fps": 30,
+                "vid": {
+                    "vmax": 100,
+                    "vmin": 0,
+                    "absolute_limits": False
+                },
+                "dff": {
+                    "tau": 10,
+                    "vmax": 100,
+                    "vmin": 0,
+                    "absolute_limits": False
+                },
+                "zpos": None,
+                "scalebar": 200,
+                "transpose": False
+            }
+        f.create_dataset("vid_params", data=json.dumps(vid_params).encode('utf-8'))
+        
+
+
+class Averager:
+    def __init__(self, shape=None):
+        self.shape = shape
+        if self.shape is not None:
+            self.init_avg()
+        self.n=0
+    def init_avg(self):
+        self.avg = cp.zeros(shape=self.shape, dtype=cp.float32)
+
+    def step(self, vol):
+        if self.shape is None:
+            self.shape = vol.shape
+            self.init_avg()
+        assert vol.shape == self.avg.shape, "vol must have same shape as average"
+        vol = cp.asarray(vol)
+        self.n += 1
+        self.avg += (vol - self.avg) / self.n
+        
+    def retrieve(self):
+        return self.avg.get()
+
+
+def extract_traces(paths):
+    ...
+
 
 
 # def register_recording_parallel(paths,):
@@ -307,68 +401,3 @@ def registered_volume_reader(paths, idx=None):
 #     video_writer.close()
 #     print(f"Registration finished in {time.strftime("%H:%M:%S", time.gmtime(time.time()-start_time))}")
 
-
-
-def save_register_recipe(paths, recipe, ref_vol, crop, vid_params=None, eye_mask=None):
-    recipe_yaml_path = paths.reg_recipe[:-3] + '.yaml'  
-    recipe.to_yaml(recipe_yaml_path)
-    with h5py.File(paths.reg_recipe, 'w') as f:
-        f.create_dataset('recipe_path', data=recipe_yaml_path)
-        f.create_dataset('ref_vol', data=ref_vol)
-        
-        if crop is None:
-            crop = (0, ref_vol.shape[1], 0, ref_vol.shape[2])
-        f.create_dataset('crop', data=crop)
-        assert ref_vol.shape == (ref_vol.shape[0],crop[1]-crop[0],crop[3]-crop[2]), "crop must be compatible with ref_vol shape"
-        
-        if eye_mask is not None:
-            f.create_dataset("eyemask", data=eye_mask)
-
-        if vid_params is None:
-            vid_params = {
-                "write_video": False,
-                "write_dff_video": False,
-                "fps": 30,
-                "vid": {
-                    "vmax": 100,
-                    "vmin": 0,
-                    "absolute_limits": False
-                },
-                "dff": {
-                    "tau": 10,
-                    "vmax": 100,
-                    "vmin": 0,
-                    "absolute_limits": False
-                },
-                "zpos": None,
-                "scalebar": 200,
-                "transpose": False
-            }
-        f.create_dataset("vid_params", data=json.dumps(vid_params).encode('utf-8'))
-        
-
-
-class Averager:
-    def __init__(self, shape=None):
-        self.shape = shape
-        if self.shape is not None:
-            self.init_avg()
-        self.n=0
-    def init_avg(self):
-        self.avg = cp.zeros(shape=self.shape, dtype=cp.float32)
-
-    def step(self, vol):
-        if self.shape is None:
-            self.shape = vol.shape
-            self.init_avg()
-        assert vol.shape == self.avg.shape, "vol must have same shape as average"
-        vol = cp.asarray(vol)
-        self.n += 1
-        self.avg += (vol - self.avg) / self.n
-        
-    def retrieve(self):
-        return self.avg.get()
-
-
-def extract_traces(paths):
-    ...

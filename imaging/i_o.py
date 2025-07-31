@@ -54,6 +54,7 @@ class Paths():
         self.meta = os.path.join(self.pn_rec, 'meta.json')
         self.raw = os.path.join(self.pn_rec, 'data.h5')
         self.deconvolved = os.path.join(self.pn_outrec, 'deconvolved.h5')
+        self.reg_mask = os.path.join(self.pn_outrec, 'reg_mask.h5')
         self.registered = os.path.join(self.pn_outrec, 'registered.h5')
         self.reg_recipe = os.path.join(self.pn_outrec, 'reg_recipe.h5')
 

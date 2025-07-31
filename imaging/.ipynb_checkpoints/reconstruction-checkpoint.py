@@ -9,8 +9,9 @@ import tempfile
 from daio.h5 import lazyh5
 import os, pathlib, socket, glob, traceback
 import threading, queue, time
-from video import AVWriter, create_projection_image
+from video import AVWriter, create_projection_image, AVWriter2
 from slurm import SlowProgressLogger
+from i_o import AsyncH5Writer, VolumeReader, InitVolumeManager, get_available_gpus
 
 
 def get_OTF(paths,
@@ -20,7 +21,7 @@ def get_OTF(paths,
             xy_pad=201,
             verbose=True
             ):
-    otf_path = os.path.join(paths.pn_scratch + f"/OTF_{paths.psf_name}_pad{xy_pad}{"_clip" if OTF_clip else ""}{"_norm" if OTF_normalize else ""}{f'_dwn{psf_downsample}' if psf_downsample is not None else ''}.npy")
+    otf_path = os.path.join(paths.pn_otfs + f"/OTF_{paths.psf_name}_pad{xy_pad}{"_clip" if OTF_clip else ""}{"_norm" if OTF_normalize else ""}{f'_dwn{psf_downsample}' if psf_downsample is not None else ''}.npy")
     if psf_downsample is None:
         psf_downsample = [0, None, 1]
     if os.path.exists(otf_path):
@@ -39,7 +40,7 @@ def get_OTF(paths,
             mask = np.array(f["circle_mask"])[crop[0]:crop[1], crop[2]:crop[3]]
             zpos = np.array(f["z_positions"])
             zpos = zpos[psf_downsample[0]:psf_downsample[1]:psf_downsample[2]] if psf_downsample is not None else zpos
-            psf = cp.array(f["psf"])
+            psf = np.array(f["psf"])
   
         size_y = psf.shape[1] + 2 * xy_pad
         size_x = psf.shape[2] + 2 * xy_pad
@@ -49,8 +50,9 @@ def get_OTF(paths,
             psf_downsample[1] = psf[:psf_downsample[1],:,:].shape[0]
         size_z = len(range(*psf_downsample))
 
+
         #calculate OTF
-        OTF = cp.zeros((size_z, size_y, size_x), dtype=cp.complex64)
+        OTF = np.zeros((size_z, size_y, size_x), dtype=np.complex64)
 
         for i,z in enumerate(tqdm(range(*psf_downsample), desc=f"Calculating OTF: (downsampling PSF by {psf_downsample[2]})")):
             slice_processed = cp.asarray(psf[z,:,:]).astype(cp.float32)
@@ -58,34 +60,16 @@ def get_OTF(paths,
                 slice_processed = cp.clip(slice_processed, 0, None)
             if OTF_normalize:
                 slice_processed /= slice_processed.sum()
-            OTF[i, :, :] = fft2(ifftshift(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')))
+            OTF[i, :, :] = (fft2(ifftshift(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant')))).get()
             # OTF[z, :, :] = fft2(cp.pad(slice_processed, ((xy_pad, xy_pad), (xy_pad, xy_pad)), mode='constant'))
             # assert slice_processed.sum() = 1, "OTF not normalized"
-        cp.save(otf_path, OTF)
-        OTF = OTF.get()
+        np.save(otf_path, OTF)
         del psf 
+
 
     return OTF, size_z, size_y, size_x, crop, mask, zpos, otf_path
 
 
-
-class PrevVolumeManager:
-    def __init__(self, size_z, roi_size, reuse_prev_vol):
-        self.lock = threading.Lock()
-        self.volume = cp.ones((size_z, 2 * roi_size, 2 * roi_size), dtype=cp.float32)
-        self.index= -1
-        self.reuse_prev_vol = reuse_prev_vol
-    
-    def update(self, volume, idx):
-        if self.reuse_prev_vol:
-            if idx > self.index:
-                with self.lock:
-                    self.volume = volume
-                    self.index = idx
-
-    def get(self):   
-        with self.lock:
-            return self.volume
 
 def reconstruct_vols_from_imgs_parallel(paths,
                                         img_idx=None,
@@ -102,11 +86,13 @@ def reconstruct_vols_from_imgs_parallel(paths,
                                         img_mask=True,
                                         fully_batched=False,
                                         write_mip_video=True,
+                                        out_crop=None,
                                         vmin=0,
                                         vmax=100,
                                         absolute_limits=False,
+                                        transpose=False,
                                         force_new=False,
-                                        verbose=True,
+                                        verbose=1,
                                         ):
     """
     Reconstructs volumes from images using the Richardson-Lucy algorithm.
@@ -146,7 +132,7 @@ def reconstruct_vols_from_imgs_parallel(paths,
 
     force_new (bool): Whether to overwrite existing files.
 
-    verbose (bool): Whether to print progress messages.
+    verbose (bool): 1 for basic progress messages, 2 for detailed progress messages.
     
 
     Reading and writing are seperated into seperate threads, so that reading, writing and deconvolution can happen in parallel
@@ -167,6 +153,9 @@ def reconstruct_vols_from_imgs_parallel(paths,
     
     crop = _crop if crop is None else crop
 
+    if out_crop is None:
+        out_crop = 0, 2 * roi_size, 0, 2 * roi_size
+
     fps = json.load(open(paths.meta))["acquisition"]["fps"]
     led_pwr = json.load(open(paths.meta))["acquisition"]["led_percent"]
 
@@ -174,23 +163,21 @@ def reconstruct_vols_from_imgs_parallel(paths,
         bg_data = lazyh5(paths.bg)
         if (fps, led_pwr) != (bg_data["fps"], bg_data["led_percent"]):
             raise Warning(f"Background data fps ({bg_data['fps']}) and led power ({bg_data['led_percent']}) do not match acquisition data fps ({fps}) and led power ({led_pwr}). This may lead to incorrect background subtraction.")
-        bg = np.array(bg_data["data"])
+        bg = np.array(bg_data["data"]).astype(np.uint8)
     elif paths.bg == "" and img_subtract_bg:
         raise ValueError("no background file specified")
 
 
-    print("Setting up I/O queues") if verbose else None
+    print("Setting up I/O queues") if verbose >= 1 else None
     #determine the read indexes
-    with h5py.File(paths.raw, 'r') as f:
-        if img_idx is None:
-            n_img = f["data"].shape[0]
-            read_idx = range(n_img)
-            save_fn = paths.deconvolved
-        else:
-            assert len(img_idx) == 3, "n_img must be a tuple of (start, stop, step)"
-            read_idx = range(img_idx[0], img_idx[1], img_idx[2])
-            n_img = len(read_idx)
-            save_fn = paths.deconvolved[:-3]+ f"_frames{img_idx[0]}-{img_idx[1]}.h5"
+    if img_idx is None:
+        with h5py.File(paths.raw, 'r') as f:
+            img_idx = (0, f["data"].shape[0], 1)
+        save_fn = paths.deconvolved
+    else:
+        assert len(img_idx) == 3, "img_idx must be a tuple of (start, stop, step)"
+        save_fn = paths.deconvolved[:-3]+ f"_frames{img_idx[0]}-{img_idx[1]}.h5"
+    read_idx = range(img_idx[0], img_idx[1], img_idx[2])
 
 
     # handle existing files
@@ -209,9 +196,9 @@ def reconstruct_vols_from_imgs_parallel(paths,
                     )
             if param_match:
                 processed_indices = f['processed_indices'][:]
-                print(f"Resuming from existing file. {len(processed_indices)}/{n_img} volumes already processed.") if verbose else None
                 read_idx = [i for i in read_idx if i not in processed_indices]
-                n_img = len(read_idx)
+                print(f"Resuming from existing file. {len(processed_indices)}/{len(read_idx)} volumes already processed.") if verbose else None
+
             else:
                 print("Parameters do not match, overwriting existing file.") if verbose else None
                 os.remove(save_fn)
@@ -224,109 +211,47 @@ def reconstruct_vols_from_imgs_parallel(paths,
     else:
         print(f"Writing into new file: {save_fn}") if verbose else None
 
-    n_gpus = cp.cuda.runtime.getDeviceCount()
+    n_gpus = get_available_gpus(verbose= (verbose >= 2))
     stop_event = threading.Event()
 
-    # set up reading queue
-    read_queue = queue.Queue(maxsize=n_gpus*2+1)
-    def reader_worker(stop_event):
-        try:
-            with h5py.File(paths.raw, 'r') as f:
-                read_loop = tqdm(read_idx, desc="Reader") if verbose else read_idx
-                for it, frame_n in enumerate(read_loop):
-                    if stop_event.is_set():
-                        break
-                    read_queue.put((it,f["data"][frame_n, crop[0]:crop[1], crop[2]:crop[3]],frame_n))
-            for i in range(n_gpus):
-                read_queue.put(None)
-        except Exception as e:
-            print(f"Error in reader worker:\n{traceback.format_exc()}")
-            stop_event.set()
-            for i in range(n_gpus):
-                read_queue.put(None)
-    reader_thread = threading.Thread(target=reader_worker, args=(stop_event,))
-    reader_thread.start()
+    # set IO workers
+    reader = VolumeReader(paths.raw, 'data', i_frames=read_idx, prefetch=2*n_gpus, verbose=(verbose >= 2))
 
-    # set up writing queue
-    write_queue = queue.Queue(maxsize=n_gpus*2+1)
-    def writer_worker(stop_event):
-        progress= SlowProgressLogger(n_img, description="Writer", update_interval=60) if verbose else None
-        with h5py.File(save_fn, 'w') as f:
-            # Create dataset for the reconstructed volume     
-            dset = f.create_dataset("data", shape=(n_img, size_z, 2*roi_size, 2*roi_size), dtype=np.float32)        
-            losses = f.create_dataset("losses", shape=(n_img,max_iter), dtype=np.float32)
-            n_iters = f.create_dataset("n_iters", shape=(n_img,), dtype=np.int32)
-            grp = f.create_group("deconvolution_params")
-            grp.attrs["roi_size"] = roi_size
-            grp.attrs["xy_pad"] = xy_pad
-            grp.attrs["max_iter"] = max_iter
-            grp.attrs["loss_threshold"] = loss_threshold
-            grp.attrs["OTF"] = otf_path
-            grp.attrs["reuse_prev_vol"] = reuse_prev_vol
-            grp.attrs["img_subtract_bg"] = img_subtract_bg
-            grp.attrs["img_mask"] = img_mask
-            processed_indices = []
-
-            try:
-                while not stop_event.is_set():
-                    item = write_queue.get()
-                    if item is None:
-                        break
-                    it, obj_recon, loss, n_iter = item
-                    dset[it, :, :, :] = obj_recon
-                    losses[it,:] = loss
-                    n_iters[it] = n_iter
-                    processed_indices.append(it)
-                    dset.flush()
-                    write_queue.task_done()
-                    progress.update()
-                f.create_dataset("processed_indices", data=processed_indices)
-            except Exception as e:
-                print(f"Error in writer worker:\n{traceback.format_exc()}")
-                stop_event.set()
-                f.create_dataset("processed_indices", data=processed_indices)
-    writer_thread = threading.Thread(target=writer_worker, args=(stop_event,))
-    writer_thread.start()
-
-    # set up video writer
-    if write_mip_video:
-        video_writer_queue = queue.Queue(maxsize=n_gpus*2+1) 
-        fn_vid = save_fn.replace('.h5', f"_mip_vmin{vmin}_vmax{vmax}{'_al' if absolute_limits else ''}.mp4")
-        def video_writer_worker(stop_event):
-            next_idx = 0
-            buffer = {}
-            video_writer=None
-            while not stop_event.is_set():
-                item = video_writer_queue.get()
-                if item is None:
-                    break
-                idx, mip = item
-                if video_writer is None:
-                    video_writer = AVWriter(fn_vid, 
-                                            height=mip.shape[0],
-                                            width=mip.shape[1],
-                                            fps=fps,
-                                            pix_fmt='yuv420p',
-                                            out_fmt='gray',)
-                buffer[idx] = mip
-                while next_idx in buffer:
-                    video_writer.write(mip.astype(np.uint8))
-                    del buffer[next_idx]
-                    next_idx += 1
-                video_writer_queue.task_done()
-
-        video_writer_thread = threading.Thread(target=video_writer_worker, args=(stop_event,))
-        video_writer_thread.start()
+    writer = AsyncH5Writer(save_fn, verbose=(verbose >= 2))
+    writer.write_meta('deconvolution_params', {'OTF': otf_path,
+                                                'roi_size': roi_size,
+                                                'max_iter': max_iter,
+                                                'xy_pad': xy_pad,
+                                                'loss_threshold': loss_threshold,
+                                                'reuse_prev_vol': reuse_prev_vol,
+                                                'img_subtract_bg': img_subtract_bg,
+                                                'img_mask': img_mask,
+                                                'psf_downsample': psf_downsample,
+                                                'OTF_normalize': OTF_normalize,
+                                                'OTF_clip': OTF_clip,
+                                                'crop': crop,
+                                                'out_crop': out_crop,
+                                                'vmin': vmin,
+                                                'vmax': vmax,
+                                                'absolute_limits': absolute_limits,
+                                                'transpose': transpose,
+                                                })
+    writer.create_dataset('data', shape=(reader.len, size_z, out_crop[1]-out_crop[0], out_crop[3]-out_crop[2]), dtype=np.float32)
+    writer.create_dataset('losses', shape=(reader.len, max_iter), dtype=np.float32)
+    writer.create_dataset('n_iter', shape=(reader.len,), dtype=np.int32)
+    writer.write_dataset('zpos', zpos)
     
-    # set up previous volume manager
-    prev_volume_manager = PrevVolumeManager(size_z=size_z, roi_size=roi_size, reuse_prev_vol=reuse_prev_vol)
+    if write_mip_video:
+        fn_vid = paths.deconvolved[:-3] + f"_f{"_all" if img_idx is None else img_idx}_mip_vmin{vmin}_vmax{vmax}{"_al" if absolute_limits else ""}.mp4"
+        video_writer = AVWriter2(fn_vid, fps=fps, expected_indeces=read_idx, verbose=(verbose >= 2))
+
+    init_volume_manager = InitVolumeManager(size_z, roi_size, reuse_prev_vol)
 
     # Define the GPU worker class
     class GPUWorker:
         def __init__(self, gpu_id, fully_batched=False):
             self.gpu_id = gpu_id
             cp.cuda.Device(gpu_id).use()
-            
             self.OTF = cp.asarray(OTF)
             self.mask = cp.asarray(mask) if img_mask else None
             self.bg = cp.asarray(bg) if img_subtract_bg else None
@@ -335,11 +260,11 @@ def reconstruct_vols_from_imgs_parallel(paths,
 
         def init_memory(self):
             if not self.fully_batched:
-                print(f"GPU {self.gpu_id}: Initializing Memory") if verbose else None
+                print(f"GPU {self.gpu_id}: Initializing Memory") if verbose >= 1 else None
                 self.temp_obj = cp.zeros((size_y, size_x), dtype=cp.float32)                
                 self.temp = cp.zeros((size_y, size_x), dtype=cp.float32)
             else:
-                print(f"GPU {self.gpu_id}: Initializing Memory for fully batched deconvolution") if verbose else None
+                print(f"GPU {self.gpu_id}: Initializing Memory for fully batched deconvolution") if verbose >= 1 else None
                 self.temp_obj = cp.zeros((size_z, size_y, size_x), dtype=cp.float32)
             self.img_est = cp.zeros((size_y, size_x), dtype=cp.float32)
             self.ratio_img = cp.zeros((size_y, size_x), dtype=cp.float32)
@@ -351,9 +276,9 @@ def reconstruct_vols_from_imgs_parallel(paths,
             if img_mask: img *= self.mask
             self.img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
 
-            self.obj_recon = cp.asarray(prev_volume_manager.get()).copy()
+            self.obj_recon = cp.asarray(init_volume_manager.get()).copy()
 
-            loop = tqdm(range(max_iter), desc=f"GPU {self.gpu_id}: Deconvolving image {it+1}/{n_img}", leave=False) if verbose else range(max_iter)
+            loop = tqdm(range(max_iter), desc=f"GPU {self.gpu_id}: Deconvolving image {it+1}/{reader.len}", leave=False) if verbose >= 1 else range(max_iter)
 
             for iter in loop:
                 self.img_est.fill(0)
@@ -381,8 +306,7 @@ def reconstruct_vols_from_imgs_parallel(paths,
                 loss = cp.mean(cp.abs(cp.log(ratio_[ratio_>0])))
                 self.losses[iter] = loss
                 if loss < loss_threshold:
-                    break      
-                
+                    break    
             return self.obj_recon.get(), self.losses.get(), iter
         
         def deconvolve_batch(self, it, img):
@@ -390,9 +314,9 @@ def reconstruct_vols_from_imgs_parallel(paths,
             if img_mask: img *= self.mask
             self.img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
 
-            self.obj_recon = cp.asarray(prev_volume_manager.get()).copy()
+            self.obj_recon = cp.asarray(init_volume_manager.get()).copy()
 
-            loop = tqdm(range(max_iter), desc=f"GPU {self.gpu_id}: Deconvolving image {it+1}/{n_img}", leave=False) if verbose else range(max_iter)
+            loop = tqdm(range(max_iter), desc=f"GPU {self.gpu_id}: Deconvolving image {it+1}/{reader.len}", leave=False) if verbose >= 1 else range(max_iter)
 
             for iter in loop:
                 self.img_est.fill(0)
@@ -417,48 +341,55 @@ def reconstruct_vols_from_imgs_parallel(paths,
 
     # Define the GPU worker loop
     failed_gpus = 0
+    processed_indeces = []
+    # Create mapping from original frame indices to sequential indices
+    frame_to_index = {frame_n: i for i, frame_n in enumerate(read_idx)}
+    
     def gpu_worker_loop(gpu_id):
         worker = GPUWorker(gpu_id, fully_batched=fully_batched)
         try:
             while not stop_event.is_set():
-                item = read_queue.get()
+                item = reader.get_next()
                 if item is None:
                     break
-                idx, img, frame_n = item
+                frame_n, img = item
+                # Get the sequential index for this frame
+                output_idx = frame_to_index[frame_n]
+                print(f"GPU {gpu_id}: Processing frame {frame_n+1}/{reader.len} with shape {img.shape}") if verbose >= 2 else None
                 if not worker.fully_batched:
-                    obj_recon, losses_arr, n_iter = worker.deconvolve(idx, cp.array(img))
+                    obj_recon, losses_arr, n_iter = worker.deconvolve(frame_n, cp.asarray(img))
                 else:
                     try:
-                        obj_recon, losses_arr, n_iter = worker.deconvolve_batch(idx, cp.array(img))
+                        obj_recon, losses_arr, n_iter = worker.deconvolve_batch(frame_n, cp.asarray(img))
                     except cp.cuda.memory.OutOfMemoryError:
-                        print(f"GPU{gpu_id} ran out of memory, switching to nonbatched deconvolution")
+                        print(f"GPU {gpu_id} ran out of memory, switching to nonbatched deconvolution") if verbose >= 1 else None
                         worker.fully_batched = False
                         worker.init_memory()
-                        obj_recon, losses_arr, n_iter = worker.deconvolve(idx, cp.array(img))
-                write_queue.put((idx, obj_recon, losses_arr, n_iter))
+                        obj_recon, losses_arr, n_iter = worker.deconvolve(frame_n, cp.asarray(img))
+                obj_recon = obj_recon[:,out_crop[0]:out_crop[1],out_crop[2]:out_crop[3]]
+                writer.write('data', obj_recon, output_idx)
+                writer.write('losses', losses_arr, output_idx)
+                writer.write('n_iter', n_iter, output_idx)
                 if write_mip_video:
                     mip = create_projection_image(obj_recon, 
                                                 text=str(frame_n), 
                                                 vmin=vmin,vmax=vmax,
                                                 scalebar=200, zpos=zpos,
                                                 text_size=1,
-                                                absolute_limits=absolute_limits)
-                    video_writer_queue.put((idx, mip))
-                prev_volume_manager.update(obj_recon, idx)
-                read_queue.task_done()
+                                                absolute_limits=absolute_limits,
+                                                transpose=transpose)
+                    video_writer.write(mip, frame_n)
+                init_volume_manager.update(obj_recon, frame_n)
+                processed_indeces.append(frame_n)
         except Exception as e:
             print(f"Error in GPU worker {gpu_id}: \n{traceback.format_exc()}")
             nonlocal failed_gpus
             failed_gpus += 1
             if failed_gpus == n_gpus:
-                print("all GPU workers failed, stopping all workers.")
-                stop_event.set()
-                # Clear the read queue
-                try: [read_queue.get_nowait() for _ in range(read_queue.qsize())] 
-                except queue.Empty: pass
+                print("all GPU workers failed, stopping all workers.") if verbose >= 1 else None
             else:
-                print(f"Putting frame {idx} back to read queue")
-                read_queue.put((idx, img, frame_n))
+                print(f"Putting frame {frame_n} back to read queue") if verbose >= 1 else None
+                reader.put_back((frame_n, img))
                 
     # Start GPU worker threads
     gpu_threads = []
@@ -467,18 +398,15 @@ def reconstruct_vols_from_imgs_parallel(paths,
         t.start()
         gpu_threads.append(t)
 
-
     # Stop the IO threads
     for t in gpu_threads:
         t.join()
     stop_event.set()
-    write_queue.put(None)
-    reader_thread.join(timeout=60)
-    writer_thread.join(timeout=300)
+    writer.write_dataset('processed_indices', np.array(processed_indeces, dtype=np.int32))
+    writer.close()
     if write_mip_video:
-        video_writer_queue.put(None)
-        video_writer_thread.join(timeout=60)
-    print(f"Deconvolution finished in {time.strftime("%H:%M:%S", time.gmtime(time.time()-start_time))}") if verbose else None
+        video_writer.close()
+    print(f"Deconvolution finished in {time.strftime("%H:%M:%S", time.gmtime(time.time()-start_time))}") if verbose >=1 else None
 
     kwargs = dict(max_iter=max_iter,
                   xy_pad=xy_pad,
@@ -492,11 +420,15 @@ def reconstruct_vols_from_imgs_parallel(paths,
                   img_subtract_bg=img_subtract_bg,
                   img_mask=img_mask,
                   fully_batched=fully_batched,
+                  out_crop=out_crop,
                   vmin=vmin,
                   vmax=vmax,
-                  absolute_limits=absolute_limits,)
+                  absolute_limits=absolute_limits,
+                  transpose=transpose,)
     
     return kwargs, save_fn, fn_vid if write_mip_video else None
+
+
 
 def reconstruct_vols_from_imgs(paths,
                                img_idx=None,
@@ -511,11 +443,14 @@ def reconstruct_vols_from_imgs(paths,
                                crop=None,
                                img_subtract_bg=False,
                                img_mask=True,
+                               img_normalize=True,
+                               img_normalize_percentiles=(5,95),
                                fully_batched=False,
                                plot_decon=True,
                                    vmin=0,
                                    vmax=100,
                                    absolute_limits=False,
+                                   transpose=False,
                                verbose=True):
     """
     for reconstructing a small amount of images, no I/O, everything kept in memory
@@ -568,8 +503,10 @@ def reconstruct_vols_from_imgs(paths,
     for it, frame_n in enumerate(tqdm(read_idx, desc="Reconstructing volumes")):
         with h5py.File(paths.raw, 'r') as f:
             img = cp.asarray(f["data"][frame_n, crop[0]:crop[1], crop[2]:crop[3]])
-        if img_subtract_bg: img -= bg
+        if img_subtract_bg: img = img- bg
+        if img_normalize: img = percentile_normalize(img, *img_normalize_percentile)
         if img_mask: img *= mask
+        img = img.clip(1e-6, None)
         img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
         if not reuse_prev_vol:
                 obj_recon.fill(1)
@@ -607,9 +544,10 @@ def reconstruct_vols_from_imgs(paths,
             
             if plot_decon:
                 plots_mip[it, iter,:,:] = create_projection_image(obj_recon, 
-                                                                text=str(frame_n), 
+                                                                text=f"{frame_n}, {iter}", 
                                                                 vmin=vmin, vmax=vmax,absolute_limits=absolute_limits,
-                                                                scalebar=200, zpos=zpos,text_size=3,)
+                                                                scalebar=200, zpos=zpos,text_size=3,
+                                                                transpose=transpose)
 
            #calculate loss
             ratio_ = ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad]
@@ -632,10 +570,18 @@ def reconstruct_vols_from_imgs(paths,
                   crop=crop,
                   img_subtract_bg=img_subtract_bg,
                   img_mask=img_mask,
+                  img_normalize=img_normalize,
+                  img_normalize_percentiles=img_normalize_percentiles,
                   fully_batched=fully_batched,
                   vmin=vmin,
                   vmax=vmax,
-                  absolute_limits=absolute_limits,)
+                  absolute_limits=absolute_limits,
+                  transpose=transpose)
 
     return objs, plots_mip, losses, kwargs
 
+def percentile_normalization(arr, low_percentile=5, high_percentile=95):
+    arr = cp.asarray(arr)
+    p_low = cp.percentile(img, low_percentile)
+    p_high = cp.percentile(img, high_percentile)
+    return (img - p_low) / (p_high - p_low + cp.finfo(cp.float32).eps)

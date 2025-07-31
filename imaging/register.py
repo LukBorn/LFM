@@ -163,6 +163,8 @@ def register_recording(paths):
         ref_vol = cp.asarray(f['ref_vol'])
         crop = np.asarray(f['crop'])
         vid_params = json.loads(f['vid_params'][()])
+        cov_tau = f['cov_tau'][()]
+        r_threshold = f['r_threshold'][()]
     
     with h5py.File(paths.reg_mask, 'r') as f:
         try:
@@ -187,8 +189,8 @@ def register_recording(paths):
     writer.write_meta('recipe', {"path": recipe_yaml_path})
     writer.create_dataset("metrics", shape=(reader.len, 3), dtype=np.float32)
     
-    cov_mapper = NeighborhoodCovMapper(tau=recipe.cov_tau)
-    corr_mapper = NeighborhoodCorrMapper(tau=recipe.cov_tau)
+    cov_mapper = NeighborhoodCovMapper(tau=cov_tau)
+    corr_mapper = NeighborhoodCorrMapper(tau=cov_tau)
     corr_mapper_2 = NeighborhoodCorrMapper(tau=2)
 
     if vid_params["write_video"]:
@@ -211,7 +213,7 @@ def register_recording(paths):
         metrics = np.array(calculate_metrics(ref_vol, registered_vol, verbose=False))
         writer.write("metrics", metrics, frame_n)
 
-        if metrics[0] > recipe.r_threshold:
+        if metrics[0] > r_threshold:
             cov_mapper.step(registered_vol)
             corr_mapper.step(registered_vol)
             corr_mapper_2.step(registered_vol)
@@ -274,13 +276,14 @@ def registered_volume_reader(paths, idx=None):
 
 
 
-def save_register_recipe(paths, recipe, ref_vol, crop, vid_params=None, eye_mask=None, cov_tau=60):
+def save_register_recipe(paths, recipe, ref_vol, crop, vid_params=None, eye_mask=None, cov_tau=60, r_threshold=0.8):
     recipe_yaml_path = paths.reg_recipe[:-3] + '.yaml'  
     recipe.to_yaml(recipe_yaml_path)
     with h5py.File(paths.reg_recipe, 'w') as f:
         f.create_dataset('recipe_path', data=recipe_yaml_path)
         f.create_dataset('ref_vol', data=ref_vol)
         f.create_dataset('cov_tau', data=cov_tau)
+        f.create_dataset('r_threshold', data=r_threshold)
         if crop is None:
             crop = (0, ref_vol.shape[1], 0, ref_vol.shape[2])
         f.create_dataset('crop', data=crop)

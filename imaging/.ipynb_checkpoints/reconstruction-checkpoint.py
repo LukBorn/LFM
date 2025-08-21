@@ -9,7 +9,7 @@ import tempfile
 from daio.h5 import lazyh5
 import os, pathlib, socket, glob, traceback
 import threading, queue, time
-from video import AVWriter, create_projection_image, AVWriter2
+from video import create_projection_image, AVWriter2
 from slurm import SlowProgressLogger
 from i_o import AsyncH5Writer, VolumeReader, InitVolumeManager, get_available_gpus
 
@@ -84,9 +84,12 @@ def reconstruct_vols_from_imgs_parallel(paths,
                                         crop=None,
                                         img_subtract_bg=False,
                                         img_mask=True,
+                                        img_normalize=True,
                                         fully_batched=False,
                                         write_mip_video=True,
                                         out_crop=None,
+                                        projection="max",
+                                        slice_idx=None,
                                         vmin=0,
                                         vmax=100,
                                         absolute_limits=False,
@@ -272,8 +275,11 @@ def reconstruct_vols_from_imgs_parallel(paths,
             self.losses = cp.zeros(max_iter, dtype=cp.float32)
 
         def deconvolve(self, it, img):
+            img = cp.asarray(img, dtype=cp.float32)
+            if img_normalize: img /= img.mean(dtype=cp.float32)
             if img_subtract_bg: img -= self.bg
             if img_mask: img *= self.mask
+            
             self.img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
 
             self.obj_recon = cp.asarray(init_volume_manager.get()).copy()
@@ -371,13 +377,9 @@ def reconstruct_vols_from_imgs_parallel(paths,
                 writer.write('losses', losses_arr, output_idx)
                 writer.write('n_iter', n_iter, output_idx)
                 if write_mip_video:
-                    mip = create_projection_image(obj_recon, 
-                                                text=str(frame_n), 
-                                                vmin=vmin,vmax=vmax,
-                                                scalebar=200, zpos=zpos,
-                                                text_size=1,
-                                                absolute_limits=absolute_limits,
-                                                transpose=transpose)
+                    mip = create_projection_image(obj_recon, projection=projection, slice_idx=slice_idx,
+                                                  vmin=vmin, vmax=vmax, absolute_limits=absolute_limits, transpose=transpose,
+                                                  text=f"{frame_n}, {iter}", scalebar=200, zpos=zpos,text_size=3,)
                     video_writer.write(mip, frame_n)
                 init_volume_manager.update(obj_recon, frame_n)
                 processed_indeces.append(frame_n)
@@ -444,9 +446,10 @@ def reconstruct_vols_from_imgs(paths,
                                img_subtract_bg=False,
                                img_mask=True,
                                img_normalize=True,
-                               img_normalize_percentiles=(5,95),
                                fully_batched=False,
                                plot_decon=True,
+                                   projection="max",
+                                   slice_idx=None,
                                    vmin=0,
                                    vmax=100,
                                    absolute_limits=False,
@@ -487,7 +490,7 @@ def reconstruct_vols_from_imgs(paths,
     plots_mip = np.zeros(shape=(n_img, max_iter, mip_shape, mip_shape), dtype=np.float32)
     losses = np.zeros((n_img, max_iter), dtype=np.float32)
     
-    OTF = cp.asarray(OTF)
+    OTF = np.asarray(OTF)
     mask = cp.asarray(mask) if img_mask else None
     bg = cp.asarray(bg).astype(cp.uint8) if img_subtract_bg else None
     img_est = cp.zeros((size_y, size_x), dtype=cp.float32)
@@ -502,9 +505,9 @@ def reconstruct_vols_from_imgs(paths,
 
     for it, frame_n in enumerate(tqdm(read_idx, desc="Reconstructing volumes")):
         with h5py.File(paths.raw, 'r') as f:
-            img = cp.asarray(f["data"][frame_n, crop[0]:crop[1], crop[2]:crop[3]])
+            img = cp.asarray(f["data"][frame_n, crop[0]:crop[1], crop[2]:crop[3]], dtype=cp.float32 )
         if img_subtract_bg: img = img- bg
-        if img_normalize: img = percentile_normalize(img, *img_normalize_percentile)
+        if img_normalize: img /= img.mean(dtype=cp.float32)
         if img_mask: img *= mask
         img = img.clip(1e-6, None)
         img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
@@ -520,7 +523,8 @@ def reconstruct_vols_from_imgs(paths,
                     temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size,
                              size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
                     # adding the contribution of each slice to the image estimate
-                    img_est += cp.maximum(cp.real(ifft2(OTF[z, :, :] * fft2(temp_obj))), 0)
+                    OTF_z = cp.asarray(OTF[z, :, :])
+                    img_est += cp.maximum(cp.real(ifft2(OTF_z * fft2(temp_obj))), 0)
                 #calculate ratio
                 ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad] = img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] / (
                         img_est[xy_pad:-xy_pad, xy_pad:-xy_pad] + cp.finfo(cp.float32).eps)
@@ -530,7 +534,8 @@ def reconstruct_vols_from_imgs(paths,
                     temp_obj[size_y // 2 - roi_size: size_y // 2 + roi_size,
                              size_x // 2 - roi_size: size_x // 2 + roi_size] = obj_recon[z, :, :]
                     #updating the object estimate 
-                    temp = temp_obj * (cp.maximum(cp.real(ifft2(fft2(ratio_img) * cp.conj(OTF[z, :, :]))), 0))
+                    OTF_z = cp.asarray(OTF[z, :, :])
+                    temp = temp_obj * (cp.maximum(cp.real(ifft2(fft2(ratio_img) * cp.conj(OTF_z))), 0))
                     obj_recon[z, :, :] = temp[size_y // 2 - roi_size: size_y // 2 + roi_size,
                                               size_x // 2 - roi_size: size_x // 2 + roi_size]
             else:
@@ -543,11 +548,9 @@ def reconstruct_vols_from_imgs(paths,
                 obj_recon[:, :, :] = temp_obj[:, size_y // 2 - roi_size: size_y // 2 + roi_size, size_x // 2 - roi_size: size_x // 2 + roi_size]
             
             if plot_decon:
-                plots_mip[it, iter,:,:] = create_projection_image(obj_recon, 
-                                                                text=f"{frame_n}, {iter}", 
-                                                                vmin=vmin, vmax=vmax,absolute_limits=absolute_limits,
-                                                                scalebar=200, zpos=zpos,text_size=3,
-                                                                transpose=transpose)
+                plots_mip[it, iter,:,:] = create_projection_image(obj_recon, projection=projection, slice_idx=slice_idx,
+                                                                  vmin=vmin, vmax=vmax, absolute_limits=absolute_limits, transpose=transpose,
+                                                                  text=f"{frame_n}, {iter}", scalebar=200, zpos=zpos,text_size=3,)
 
            #calculate loss
             ratio_ = ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad]
@@ -571,8 +574,9 @@ def reconstruct_vols_from_imgs(paths,
                   img_subtract_bg=img_subtract_bg,
                   img_mask=img_mask,
                   img_normalize=img_normalize,
-                  img_normalize_percentiles=img_normalize_percentiles,
                   fully_batched=fully_batched,
+                  projection=projection,
+                  slice_idx=slice_idx,
                   vmin=vmin,
                   vmax=vmax,
                   absolute_limits=absolute_limits,
@@ -582,6 +586,6 @@ def reconstruct_vols_from_imgs(paths,
 
 def percentile_normalization(arr, low_percentile=5, high_percentile=95):
     arr = cp.asarray(arr)
-    p_low = cp.percentile(img, low_percentile)
-    p_high = cp.percentile(img, high_percentile)
-    return (img - p_low) / (p_high - p_low + cp.finfo(cp.float32).eps)
+    p_low = cp.percentile(arr, low_percentile)
+    p_high = cp.percentile(arr, high_percentile)
+    return (arr - p_low) / (p_high - p_low + cp.finfo(cp.float32).eps)

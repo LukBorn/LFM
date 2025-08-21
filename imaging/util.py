@@ -8,6 +8,8 @@ import glob
 import os
 import cv2
 import av
+from signal_extraction import soft_ball
+from video import get_clipped_array
 
 def volume_to_gif(volume, gif_path="output.gif", cmap="gray", fps=10, vmin=None, vmax=None):
     images = []
@@ -180,3 +182,53 @@ def calculate_running_mean(data, chunk_size=None, dtype=cp.float64):
     mean_array = running_sum / n_frames
     
     return mean_array.astype(np.float32)
+
+def plot_traces(traces, mask,  n, ax,stim_array=None, scale_factor=10, y_add=10, fig_size=(12,8), cmap='Reds'):
+    '''
+    Plot n traces with a stimulus background indicating intensity.
+
+    Args:
+        traces (array): Traces to plot (shape: time x n).
+        mask (array): Boolean mask for valid time points.
+        stim_array (array): Stimulus intensities (same shape as mask).
+        n (int): Number of traces.
+        ax (matplotlib.axes): Axis to plot on.
+        scale_factor (float): Vertical spacing between traces.
+        y_add (float): Additional y padding.
+        fig_size (tuple): Figure size.
+        cmap (str): Colormap for stimulus background.
+
+    Returns:
+        ax (matplotlib.axes): The modified axis.
+    '''
+
+    time = np.arange(traces.shape[0])  # Time indices
+    traces_ = traces + np.arange(n)[None, :] * scale_factor  # Offset traces for visibility
+
+    if stim_array is not None:
+        stim_norm = stim_array / stim_array.max() if stim_array.max() != 0 else stim_array
+        stim_rgba = plt.get_cmap(cmap)(stim_norm)
+        stim_rgba[:, -1] = stim_norm * 0.2
+        ax.imshow(stim_rgba[np.newaxis, :, :], aspect='auto',
+                  extent=[0, traces.shape[0], -10, n * scale_factor + y_add])
+
+    # Create a color for each trace
+    color_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    colors = [color_cycle[i % len(color_cycle)] for i in range(n)]
+
+    # Find trace segments
+    split_points = np.where(np.diff(mask.astype(int)) != 0)[0] + 1
+    trace_segments = np.split(traces_, split_points)
+    time_segments = np.split(time, split_points)
+    mask_segments = np.split(mask, split_points)
+
+    # Plot each segment, using consistent color per trace
+    for t_seg, trace_seg, m_seg in zip(time_segments, trace_segments, mask_segments):
+        if m_seg[0]:
+            for i in range(n):
+                ax.plot(t_seg, trace_seg[:, i], alpha=0.5, linewidth=0.8, color=colors[i])
+
+    ax.set_ylim(-y_add, n * scale_factor + y_add)
+    return ax
+
+

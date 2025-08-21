@@ -92,10 +92,9 @@ def mini_registration(paths,
     video_reg_fn = paths.pn_outrec + f'/mini_registration_registered{"_" if fn_addendum else ""}{fn_addendum}_f{idx}_vmin{vmin}_vmax{vmax}{"_al" if absolute_limits else ""}.mp4'
     video_reg_writer = AVWriter2(video_reg_fn, fps=fps, expected_indeces=range(*idx),)
 
-    metrics = {'correlation': np.zeros(len(reader), dtype=np.float32),
+    metrics = {'r': np.zeros(len(reader), dtype=np.float32),
                'mse': np.zeros(len(reader), dtype=np.float32),
                'ssim': np.zeros(len(reader), dtype=np.float32),
-               'r': np.zeros(len(reader), dtype=np.float32),
                'dmf': np.zeros(len(reader), dtype=np.float32)}
     print(metrics.keys())
 
@@ -114,16 +113,15 @@ def mini_registration(paths,
                                       vmax=vmax, vmin=vmin, absolute_limits=absolute_limits,
                                       zpos=zpos, scalebar=200, text=f"f{frame_n}",text_size = 2,transpose=transpose)
         warpfields.append(_warpfield)
-        corr, mse, ssim_val, r = calculate_metrics(ref_vol, registered_vol, verbose)
-        metrics['correlation'][i] = corr
+        corr, mse, ssim_val = calculate_metrics(ref_vol, registered_vol, verbose)
+        metrics['r'][i] = corr
         metrics['mse'][i] = mse
         metrics['ssim'][i] = ssim_val
-        metrics['r'][i] = r
         video_reg_writer.write(mip_reg, frame_n)
     video_writer.close()
     video_reg_writer.close()
     metrics['dmf'] = (maximum_filter(median_filter(cp.asarray(metrics['r']), 3), size=21) - cp.asarray(metrics['r'])).get()
-    return video_fn, warpfields, metrics
+    return video_fn, video_reg_fn, warpfields, metrics
 
 def calculate_metrics(ref_vol, mov_vol, verbose=False):
     # Flatten volumes for metrics
@@ -234,8 +232,8 @@ def register_recording(paths):
     cov_map, var_map = cov_mapper.retrieve()
     writer.write_dataset('cov_map', cov_map)
     writer.write_dataset('var_map', var_map)
-    writer.write_dataset('corr_map', corr_mapper.retrieve().get())
-    writer.write_dataset('corr2_map', corr_mapper_2.retrieve().get())
+    writer.write_dataset('corr_map', corr_mapper.retrieve())
+    writer.write_dataset('corr2_map', corr_mapper_2.retrieve())
     writer.close()
     if vid_params["write_video"]:
         video_writer.close()

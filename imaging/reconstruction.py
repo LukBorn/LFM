@@ -9,7 +9,7 @@ import tempfile
 from daio.h5 import lazyh5
 import os, pathlib, socket, glob, traceback
 import threading, queue, time
-from video import create_projection_image, AVWriter2, create_slice_image
+from video import create_projection_image, AVWriter2
 from slurm import SlowProgressLogger
 from i_o import AsyncH5Writer, VolumeReader, InitVolumeManager, get_available_gpus
 
@@ -84,6 +84,7 @@ def reconstruct_vols_from_imgs_parallel(paths,
                                         crop=None,
                                         img_subtract_bg=False,
                                         img_mask=True,
+                                        img_normalize=True,
                                         fully_batched=False,
                                         write_mip_video=True,
                                         out_crop=None,
@@ -274,8 +275,11 @@ def reconstruct_vols_from_imgs_parallel(paths,
             self.losses = cp.zeros(max_iter, dtype=cp.float32)
 
         def deconvolve(self, it, img):
+            img = cp.asarray(img, dtype=cp.float32)
+            if img_normalize: img /= img.mean(dtype=cp.float32)
             if img_subtract_bg: img -= self.bg
             if img_mask: img *= self.mask
+            
             self.img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
 
             self.obj_recon = cp.asarray(init_volume_manager.get()).copy()
@@ -375,10 +379,10 @@ def reconstruct_vols_from_imgs_parallel(paths,
                 if write_mip_video:
                     mip = create_projection_image(obj_recon, projection=projection, slice_idx=slice_idx,
                                                   vmin=vmin, vmax=vmax, absolute_limits=absolute_limits, transpose=transpose,
-                                                  text=f"{frame_n}, {iter}", scalebar=200, zpos=zpos,text_size=3,)
+                                                  text=f"{frame_n}", scalebar=200, zpos=zpos,text_size=3,)
                     video_writer.write(mip, frame_n)
                 init_volume_manager.update(obj_recon, frame_n)
-                processed_indeces.append(frame_n)
+                processed_indeces.append(frame_n) 
         except Exception as e:
             print(f"Error in GPU worker {gpu_id}: \n{traceback.format_exc()}")
             nonlocal failed_gpus
@@ -501,9 +505,9 @@ def reconstruct_vols_from_imgs(paths,
 
     for it, frame_n in enumerate(tqdm(read_idx, desc="Reconstructing volumes")):
         with h5py.File(paths.raw, 'r') as f:
-            img = cp.asarray(f["data"][frame_n, crop[0]:crop[1], crop[2]:crop[3]])
+            img = cp.asarray(f["data"][frame_n, crop[0]:crop[1], crop[2]:crop[3]], dtype=cp.float32 )
         if img_subtract_bg: img = img- bg
-        if img_normalize: img /= img.mean()
+        if img_normalize: img /= img.mean(dtype=cp.float32)
         if img_mask: img *= mask
         img = img.clip(1e-6, None)
         img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img

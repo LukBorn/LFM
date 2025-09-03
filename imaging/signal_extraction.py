@@ -9,90 +9,9 @@ import cupyx
 import matplotlib.pyplot as plt
 from video import get_clipped_array
 
-# detect a way of where the traces should be extracted from -> covariance map while registering
-# define a kernel to extract 
-# extract teh sum(?) fluorescence from the kernel across time
-
-def ball_kernel(radius):
-    """ Make a ball kernel
-
-    Args:
-        radius (list or array_like): list of radii, one per output dimension
-
-    Return:
-        array_like: ball kernel array (dtype: bool)
-    """
-    X, Y, Z = np.meshgrid(*[np.r_[-np.floor(radius[ii]):np.floor(radius[ii]) + 1] for ii in range(3)], indexing='ij')
-    s = X * X / radius[0]**2 + Y * Y / radius[1]**2 + Z * Z / radius[2]**2
-    footprint = (s <= 1)
-    return footprint
 
 
-def soft_ball(radius, k=5):
-    """ Make a ball kernel with soft edges
 
-    Args:
-        radius (list or array_like): list of radii, one per output dimension
-        k (float): logistic smoothing parameter
-
-    Return:
-        array_like: ball kernel array
-    """
-    X, Y, Z = np.meshgrid(*[np.r_[-np.ceil(radius[ii] * (1 + 1 / k)):np.ceil(radius[ii] * (1 + 1 / k)) + 1] for ii in range(3)], indexing='ij')
-    d = X * X / radius[0]**2 + Y * Y / radius[1]**2 + Z * Z / radius[2]**2
-    footprint = 1 / (1 + np.exp(-(1-d)*k))
-    return footprint
-
-
-def findmaxima_gpu(vol, radius, thresh=0):
-    """ Find local maxima, given radius
-
-    Args:
-        vol (array_like): input array
-        radius (list or array_like): list of radii, one per dimension
-
-    Return:
-        array_like: N-D binary array of maxima
-        tuple: indices of peaks
-        array_like: 1-D list of local maximum values
-    """
-    in_class = vol.__class__
-    vol = cp.array(vol, 'float32', copy=False)
-    kernel = cp.array(ball_kernel(radius))
-    maxima_bool = (cupyx.scipy.ndimage.maximum_filter(vol, footprint=kernel) == vol)
-    maxima_bool &= vol > thresh
-    peaks = cp.nonzero(cp.array(maxima_bool))
-    peak_vals = vol[peaks]
-    if in_class == 'numpy.ndarray':
-        maxima_bool = maxima_bool.get()
-        peaks = tuple(i.get() for i in peaks)
-        peak_vals = peak_vals.get()
-    return maxima_bool, peaks, peak_vals
-
-#consider moving to ndimage
-def dogfilter_gpu(vol, sigma_low=1, sigma_high=4, mode='reflect'):
-    """ Diffference of Gaussians filter
-
-    Args:
-        vol (array_like): data to be filtered
-        sigma_low (scalar or sequence of scalar): standard deviations
-        sigma_high (scalar or sequence of scalar): standard deviations
-        mode (str): The array borders are handled according to the given mode
-   
-    Returns:
-        (array_like): filtered data
-    
-    See also:
-        cupyx.scipy.ndimage.gaussian_filter
-        skimage.filters.difference_of_gaussians
-    """
-    in_module = vol.__class__.__module__
-    vol = cp.asarray(vol, 'float32')
-    out = cupyx.scipy.ndimage.gaussian_filter(vol, sigma_low, mode=mode)
-    out -= cupyx.scipy.ndimage.gaussian_filter(vol, sigma_high, mode=mode)
-    if in_module == 'numpy':
-        out = out.get()
-    return out
 
 class NeighborhoodCovMapper:
     """ Sequentially aggregates local covariance matrix of a volume when calling .step(). 
@@ -185,7 +104,89 @@ class NeighborhoodCorrMapper:
         self.reset()
         return corr_map
 
-def segment(paths,
+def ball_kernel(radius):
+    """ Make a ball kernel
+
+    Args:
+        radius (list or array_like): list of radii, one per output dimension
+
+    Return:
+        array_like: ball kernel array (dtype: bool)
+    """
+    X, Y, Z = np.meshgrid(*[np.r_[-np.floor(radius[ii]):np.floor(radius[ii]) + 1] for ii in range(3)], indexing='ij')
+    s = X * X / radius[0]**2 + Y * Y / radius[1]**2 + Z * Z / radius[2]**2
+    footprint = (s <= 1)
+    return footprint
+
+
+def soft_ball(radius, k=5):
+    """ Make a ball kernel with soft edges
+
+    Args:
+        radius (list or array_like): list of radii, one per output dimension
+        k (float): logistic smoothing parameter
+
+    Return:
+        array_like: ball kernel array
+    """
+    X, Y, Z = np.meshgrid(*[np.r_[-np.ceil(radius[ii] * (1 + 1 / k)):np.ceil(radius[ii] * (1 + 1 / k)) + 1] for ii in range(3)], indexing='ij')
+    d = X * X / radius[0]**2 + Y * Y / radius[1]**2 + Z * Z / radius[2]**2
+    footprint = 1 / (1 + np.exp(-(1-d)*k))
+    return footprint
+
+
+def findmaxima_gpu(vol, radius, thresh=0):
+    """ Find local maxima, given radius
+
+    Args:
+        vol (array_like): input array
+        radius (list or array_like): list of radii, one per dimension
+
+    Return:
+        array_like: N-D binary array of maxima
+        tuple: indices of peaks
+        array_like: 1-D list of local maximum values
+    """
+    in_class = vol.__class__
+    vol = cp.array(vol, 'float32', copy=False)
+    kernel = cp.array(ball_kernel(radius))
+    maxima_bool = (cupyx.scipy.ndimage.maximum_filter(vol, footprint=kernel) == vol)
+    maxima_bool &= vol > thresh
+    peaks = cp.nonzero(cp.array(maxima_bool))
+    peak_vals = vol[peaks]
+    if in_class == 'numpy.ndarray':
+        maxima_bool = maxima_bool.get()
+        peaks = tuple(i.get() for i in peaks)
+        peak_vals = peak_vals.get()
+    return maxima_bool, peaks, peak_vals
+
+#consider moving to ndimage
+def dogfilter_gpu(vol, sigma_low=1, sigma_high=4, mode='reflect'):
+    """ Diffference of Gaussians filter
+
+    Args:
+        vol (array_like): data to be filtered
+        sigma_low (scalar or sequence of scalar): standard deviations
+        sigma_high (scalar or sequence of scalar): standard deviations
+        mode (str): The array borders are handled according to the given mode
+   
+    Returns:
+        (array_like): filtered data
+    
+    See also:
+        cupyx.scipy.ndimage.gaussian_filter
+        skimage.filters.difference_of_gaussians
+    """
+    in_module = vol.__class__.__module__
+    vol = cp.asarray(vol, 'float32')
+    out = cupyx.scipy.ndimage.gaussian_filter(vol, sigma_low, mode=mode)
+    out -= cupyx.scipy.ndimage.gaussian_filter(vol, sigma_high, mode=mode)
+    if in_module == 'numpy':
+        out = out.get()
+    return out
+
+
+def segment_old(paths,
             dog_sigma_low=[1.5,0.5,0.5],
             dog_sigma_high=[4,4,4],
             search_min_radius=[1,1,1],
@@ -193,7 +194,6 @@ def segment(paths,
             soft_ball_kernel=[6,3.5,3.5],
             soft_ball_k=2,
             transpose = True, 
-
             save = True
             ):
     fn = os.path.expanduser(os.path.join(paths.pn_outrec, f"segmentation_dog{dog_sigma_low}-{dog_sigma_high}_minrad{search_min_radius}_tresh{search_min_brightness}_kernel{soft_ball_kernel}_k{soft_ball_k}"))
@@ -204,9 +204,9 @@ def segment(paths,
                               sigma_low=dog_sigma_low, 
                               sigma_high=dog_sigma_high)
     maxima_bool, peaks, peak_vals = findmaxima_gpu(cov_map_f, 
-                                                   min_radius=search_min_radius, 
+                                                   radius=search_min_radius, 
                                                    thresh=search_min_brightness)
-    kernel = cp.array(soft_ball(soft_ball_kernel, soft_ball_k=soft_ball_k), 'float32')
+    kernel = cp.array(soft_ball(soft_ball_kernel, soft_ball_k), 'float32')
     kernel /= kernel.sum()
     peaks_mip = create_projection_image_with_peaks(cov_map_f, 
                                                    peaks,
@@ -226,7 +226,7 @@ def segment(paths,
                                              search_min_brightness=search_min_brightness,
                                              soft_ball_kernel=soft_ball_kernel,
                                              soft_ball_k=soft_ball_k),
-                               cov_map=cov_map_f, 
+                               cov_map_f=cov_map_f, 
                                peaks=peaks, 
                                peak_vals=peak_vals)
     if save:
@@ -238,12 +238,11 @@ def segment(paths,
                                      marker_radius=soft_ball_kernel,
                                      marker_k=soft_ball_k,
                                      vmax=2*search_min_brightness,
-                                     absolute_limits=True,
-                                    )
+                                     absolute_limits=True,)
 
     return segmentation_result, peaks_mip
 
-def extract_traces(paths,
+def extract_traces_old(paths,
                     dog_sigma_low=[1.5,1.5,1.5],
                     dog_sigma_high=[4,4,4],
                     min_radius=[3,3,3],
@@ -279,7 +278,67 @@ def extract_traces(paths,
             for key, value in traces_results.items():
                 f.create_dataset(key, data=value)
     return traces_results
+import cupyx.scipy.ndimage
+def extract_traces(paths, 
+                   params_dict={},):
+     
+    
+    # Initialize the video reader
+    reader = VolumeReader(paths.registered, "data", prefetch=10)
 
+    with h5py.File(paths.segmentation, "r") as f:
+        segmentation = np.array(f["segmentation"])
+    
+    # Get all unique region labels, excluding 0 (background)
+    labels_gpu = cp.asarray(segmentation)
+    unique_labels = cp.unique(labels_gpu)
+    unique_labels = unique_labels[unique_labels != 0]
+    
+    writer = AsyncH5Writer(paths.traces)
+    writer.write_meta("params", params_dict)
+    writer.create_dataset("traces", shape = (reader.get_shape("data")[0], unique_labels.shape[0]), dtype = np.float32)
+    writer.write_dataset("segmentation", segmentation)
+    
+    
+    for i_frame, vol in tqdm(reader, desc="Extracting mean traces"):
+        vol_gpu = cp.asarray(vol)
+        frame_means = cupyx.scipy.ndimage.mean(vol_gpu, labels=labels_gpu, index=unique_labels)
+        writer.write("traces", frame_means.get(), i_frame)
+    writer.close()
+
+
+def extract_traces_voxels(paths,
+                          voxel_size = [3,2,2],
+                          params_dict={}):
+    # Initialize the video reader
+    reader = VolumeReader(paths.registered, "data", prefetch=10)
+
+    with h5py.File(paths.segmentation, "r") as f:
+        segmentation = np.array(f["segmentation"])
+
+    labels_gpu = cp.asarray(segmentation)
+    unique_labels = cp.unique(labels_gpu)
+    unique_labels = unique_labels[unique_labels != 0]
+
+    num_voxels = voxel_size[0]*voxel_size[1]*voxel_size[2]
+
+    writer = AsyncH5Writer(paths.traces)
+    writer.write_meta("params", params_dict)
+    writer.create_dataset("traces", shape=(reader.get_shape("data")[0], unique_labels.shape[0]), dtype=np.float32)
+    writer.write_dataset("segmentation", segmentation)
+
+    # Precompute a flat label array for bincount
+    flat_labels = labels_gpu.ravel()
+    for i_frame, vol in tqdm(reader, desc="Extracting sum traces"):
+        vol_gpu = cp.asarray(vol)
+        flat_vol = vol_gpu.ravel()
+        # bincount will sum values for each label
+        sums = cp.bincount(flat_labels, weights=flat_vol, minlength=unique_labels.max() + 1)
+        # Only keep nonzero labels (skip background)
+        frame_means = sums[unique_labels]/num_voxels
+        writer.write("traces", frame_means.get(), i_frame)
+    writer.close()
+    
 def create_projection_image_with_peaks(volume, peaks,
                                       projection="max", 
                                       slice_idx=None,
@@ -512,3 +571,106 @@ def save_segmentation_result_tif(volume,
         assert ".tif" in output_fn, "outputpath must be a tiff file"
         tifffile.imwrite(output_fn, rgb.get(), imagej=True)
     return rgb
+
+def stimulus_correlation(traces, stim):
+    #calculates the Pearsons R squared for every trace with every stimulus
+    if stim.ndim == 1:
+        stim = stim[:, None]
+    stim_padded = np.zeros((traces.shape[0], stim.shape[1]))
+    stim_padded[:stim.shape[0]] = stim
+
+    # Fill NaNs in traces with column mean
+    traces = np.where(np.isnan(traces), np.nanmean(traces, axis=0), traces)
+
+    traces_std = traces.std(0)
+    traces_std[traces_std == 0] = 1
+    traces_z = (traces - traces.mean(0)) / traces_std
+
+    stim_std = stim_padded.std(0)
+    stim_std[stim_std == 0] = 1
+    stim_z = (stim_padded - stim_padded.mean(0)) / stim_std
+
+    corr = (np.dot(stim_z.T, traces_z) / traces.shape[0])
+    sorted_idx = np.argsort(corr, axis=1)[:, ::-1]
+    return corr, sorted_idx
+
+def peristimulus_histogram(traces, stim, pad=10, align_to='onset'):
+    """
+    traces: (time, cells)
+    stim: (time, n_stimuli), bool
+    pad: int, number of samples before and after event
+    align_to: 'onset' or 'offset'
+    Returns: (n_stimuli, cells, 2*pad+max_len, 2) [mean, std]
+    """
+    assert stim.dtype == bool
+
+    if stim.ndim == 1:
+        stim = stim[:, None]
+    stim_padded = np.zeros((traces.shape[0], stim.shape[1]))
+    stim_padded[:stim.shape[0]] = stim
+    stim = stim_padded
+
+    n_time, n_cells = traces.shape
+    n_stimuli = stim.shape[1]
+
+    # Find all stimulus event indices and lengths
+    stim_diff = np.diff(stim.astype(int), axis=0, prepend=0)
+    onsets = [np.where(stim_diff[:, i] == 1)[0] for i in range(n_stimuli)]
+    offsets = [np.where(stim_diff[:, i] == -1)[0] for i in range(n_stimuli)]
+
+    # Calculate individual stimulus lengths
+    stim_lengths = []
+    for i in range(n_stimuli):
+        # Pair onsets and offsets
+        o, f = onsets[i], offsets[i]
+        # If stimulus is on at the end, add end as offset
+        if len(f) < len(o):
+            f = np.append(f, n_time)
+        stim_lengths.extend(f - o)
+    max_len = np.max(stim_lengths)
+
+    # Prepare output
+    out = np.full((n_stimuli, n_cells, 2*pad+max_len, 2), np.nan)
+
+    for stim_idx in tqdm(range(n_stimuli), desc="Calculating correlation with stimulus"):
+        o, f = onsets[stim_idx], offsets[stim_idx]
+        if len(f) < len(o):
+            f = np.append(f, n_time)
+        for cell in tqdm(range(n_cells), desc="for cells",leave=False):
+            aligned = []
+            for onset, offset in zip(o, f):
+                if align_to == 'onset':
+                    start = onset - pad
+                    end = onset + max_len + pad
+                else:  # offset
+                    start = offset - max_len - pad
+                    end = offset + pad
+                # Bounds check
+                if start < 0 or end > n_time:
+                    continue
+                aligned.append(seg)
+            if aligned:
+                arr = np.stack(aligned)
+                out[stim_idx, cell, :, 0] = arr.mean(0)
+                out[stim_idx, cell, :, 1] = arr.std(0)
+    return out
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

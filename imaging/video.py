@@ -663,4 +663,104 @@ def showvid(filename, width=600, embed=False, loop=True):
 
 
 
+def rawh5_to_video(paths,
+                   df=True,
+                   stim_labels=None,
+                   fps=40,
+                   vmin=0, 
+                   vmax=100,
+                   bitrate= 10000000,
+                   absolute_limits=False,
+                   df_tau=50, 
+                   df_vmin=-0.5,
+                   df_vmax=0.5,
+                  df_absolute_limits=True,
+                   df_bitrate= 10000000,
+                  ):
+    
+    reader = VolumeReader(paths.raw, "data")
+    
+    outpath = os.path.join(paths.pn_outrec, f"{paths.dataset_name}_raw_vid_vmax{vmax}.mp4")
+    video_writer = AVWriter2(outpath, fps=fps, expected_indeces=reader.i_frames, verbose=False, bit_rate=bitrate)
+    
+    if df:
+        df_outpath = os.path.join(paths.pn_outrec, f"{paths.dataset_name}_raw_df_vid_vmin_vmax{vmax}.mp4")
+        df_video_writer = AVWriter2(df_outpath, fps=fps, expected_indeces=reader.i_frames, verbose=False, bit_rate = df_bitrate)
+    else:
+        df_outpath = None
+    
+    pad = 20
+    text_size = 3
+    average_frame = None
+    for frame_n, frame in tqdm(reader, desc="Generating raw video"):
+        try:
+            if stim_labels is not None:
+                text = f"{stim_labels[frame_n]} f{frame_n}"
+            else:
+                text = f"f{frame_n}"
+        except IndexError:
+            text = f"f{frame_n}"
+        font, lineType = cv2.FONT_HERSHEY_PLAIN, text_size+1
+        text_width, text_height = cv2.getTextSize(text, font, text_size, lineType)[0]
+        org = (frame.shape[1] - pad - text_width, frame.shape[0] - pad)
+        
+        output = get_clipped_array(frame, vmin=vmin, vmax=vmax, absolute_limits=absolute_limits).get()
+        output = cv2.putText(output, text, 
+                             org=org, 
+                             fontFace=font,
+                             fontScale=text_size, 
+                             color = 240,
+                             thickness=lineType)
+        video_writer.write(output, frame_n)
+
+        if df:
+            if average_frame is None:
+                average_frame = frame
+                output = frame
+            else:
+                average_frame = (1/df_tau) * frame + (1-1/df_tau) * average_frame
+                output = frame - average_frame
+        
+            output = get_clipped_array(output, vmin=df_vmin, vmax=df_vmax, absolute_limits=df_absolute_limits).get()
+            output = cv2.putText(output, text, 
+                                 org=org, 
+                                 fontFace=font,
+                                 fontScale=text_size, 
+                                 color = 240,
+                                 thickness=lineType)
+            df_video_writer.write(output, frame_n)
+    if df:
+        df_video_writer.close()
+    video_writer.close()
+    return outpath, df_outpath if df else None
+
+def volh5_to_df_video(reader,
+                      out_path,
+                      stim_labels = None,
+                      tau = 50,
+                      fps=40,
+                     vmin=-0.5,
+                     vmax=0.5,
+                     absolute_limits=True,
+                     transpose=True,):
+    dff_video_fn = out_path
+    dff_video_writer = AVWriter2(dff_video_fn, fps=40, expected_indeces=reader.i_frames, verbose=False)
+    average_vol = cp.ones_like(reg["cov_map"], dtype=cp.float32) 
+    for frame_n, vol in tqdm(reader, desc="dff_vid"):
+        
+        vol = cp.asarray(vol)
+        average_vol = (1/tau) * vol+ (1-1/tau) * average_vol
+        dff_vol = vol - average_vol
+        dff_mip = create_projection_image(dff_vol[5:-5,:,:],
+                                vmax=vmax, vmin=vmin, absolute_limits=True,
+                                zpos=None, scalebar=200, 
+                                text=f"{stim_labels[int(frame_n)] if stim_labels is not None else ""} f{frame_n}", transpose=True)
+        dff_video_writer.write(dff_mip, frame_n)
+    dff_video_writer.close()
+
+
+
+
+
+
 

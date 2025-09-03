@@ -10,6 +10,10 @@ import threading, queue
 from tqdm import tqdm
 import cupy as cp
 from concurrent.futures import ThreadPoolExecutor
+import os, json
+import numpy as np
+from collections import defaultdict
+from daio.h5 import lazyh5
 
 
 class Paths():
@@ -32,6 +36,7 @@ class Paths():
         # paths
         self.hostname = socket.gethostname()
         self.dataset_name = dataset_name
+        self.pn_recordings = expand(pn_rec)
         self.pn_rec = expand(pathlib.Path(pn_rec, dataset_name))
         self.pn_out = expand(pathlib.Path(pn_out))
         self.pn_outrec = expand(pathlib.Path(self.pn_out, dataset_name))
@@ -57,6 +62,8 @@ class Paths():
         self.reg_mask = os.path.join(self.pn_outrec, 'reg_mask.h5')
         self.registered = os.path.join(self.pn_outrec, 'registered.h5')
         self.reg_recipe = os.path.join(self.pn_outrec, 'reg_recipe.h5')
+        self.segmentation = os.path.join(self.pn_outrec, 'segmentation.h5')
+        self.traces = os.path.join(self.pn_outrec, 'traces.h5')
 
         #URLs
         self.url_home = url_home
@@ -419,3 +426,160 @@ def get_available_gpus(verbose= True):
     except Exception as e:
         print(f"GPU detection completely failed: {e}")
         return 1  # Fallback
+
+
+def get_stimulus(path, fps=40, combinations={}):
+
+
+    stim_data = lazyh5(os.path.expanduser(os.path.join(path, "stimdata_conditioned.h5")))
+    samplerate = stim_data["spec"]["samplerate"]
+    reverb_time = int(stim_data["spec"]["reverb_period"] * samplerate)
+
+    stimdict = {}
+    stim_names = {}
+    for i in range(len(stim_data["stimulus_collection"])):
+        stimdict[i] = stim_data["stimulus_collection"][str(i)]["stimulus"]
+        stim_names[i] = stim_data["spec"]["stimuli"][str(i)]["label"]
+
+    with open(os.path.expanduser(os.path.join(path, "stimulus_assembly_info.json")), 'r') as f:
+        stim_json = json.load(f)
+
+    stimulus_sequence_order = stim_json.get('stimulus_sequence_order', [])
+    assembly_info = stim_json.get('assembly_info', [])
+    total_duration = stim_json.get("assembly_duration", [])
+    final_stimulus = np.zeros(int(total_duration * samplerate))
+    final_stimulus_id = np.zeros(int(total_duration * samplerate))
+
+    for i, event_info in enumerate(assembly_info):
+        stim_id = stimulus_sequence_order[i]
+        if stim_id != 0:
+            stim = stimdict[stim_id]
+            if stim.shape[0]> 2*reverb_time:
+                onset_time = round(event_info.get('onset') * samplerate)
+                offset_time = round(event_info.get('offset') * samplerate)
+                final_stimulus[onset_time:offset_time] = stim[reverb_time:-reverb_time]
+                final_stimulus_id[onset_time:offset_time] = stim_id
+            else:
+                onset_time = round(event_info.get('onset') * samplerate)
+                offset_time = onset_time+stim[reverb_time:].shape[0]
+                final_stimulus[onset_time:offset_time] = stim[reverb_time:]
+                final_stimulus_id[onset_time:offset_time] = stim_id
+
+    final_stimulus_id = downsample_max(final_stimulus_id, samplerate, fps)
+    # trace_mask is not defined in your prompt, so use the same length as final_stimulus_id
+    final_stimulus_id_fps = np.zeros_like(final_stimulus_id, dtype=np.uint8)
+    final_stimulus_id_fps[:final_stimulus_id.shape[0]] = final_stimulus_id
+
+    # --- Handle combinations ---
+    # Reverse lookup: label -> index
+    label_to_idx = {v: k for k, v in stim_names.items()}
+    stim_names_comb = stim_names.copy()
+    stim_idx = max(stim_names.keys()) + 1
+
+    for comb_name, comb_labels in combinations.items():
+        stim_names_comb[stim_idx] = comb_name
+        stimdict[stim_idx] = comb_labels  # just for completeness, not used further
+        stim_idx += 1
+
+    # --- Build bool_stimulus ---
+    n_stim = len(stim_names_comb)
+    bool_stim = np.zeros((final_stimulus_id_fps.shape[0], n_stim), dtype=bool)
+
+    
+    # Individual stimuli (skip silence, which is 0)
+    for idx in range(1, len(stim_names)):
+        bool_stim[:, idx] = final_stimulus_id_fps == idx
+    
+    if combinations != {}:
+        stim_names[0] = "all"
+        # First row: True when not silence
+        bool_stim[:, 0] = final_stimulus_id_fps != 0
+        
+        
+        # Combination stimuli
+        for i, (comb_name, comb_labels) in enumerate(combinations.items()):
+            comb_idx = len(stim_names) + i
+            indices = [label_to_idx[lbl] for lbl in comb_labels]
+            mask = np.isin(final_stimulus_id_fps, indices)
+            bool_stim[:, comb_idx] = mask
+
+    return bool_stim, stim_names_comb, final_stimulus_id_fps, final_stimulus, samplerate
+
+def downsample_max(arr, samplerate, fps):
+    window = int(samplerate / fps)
+    n_full = arr.shape[0] // window
+    arr_main = arr[:n_full * window]
+    arr_rest = arr[n_full * window:]
+    # Take max in each window
+    downsampled = arr_main.reshape(-1, window).max(axis=1)
+    # Handle any leftover samples (pad if needed)
+    if arr_rest.size > 0:
+        downsampled = np.concatenate([downsampled, [arr_rest.max()]])
+    return downsampled
+
+def parse_combinations(stim_names, combospec):
+    """
+    combinations = {
+    "R": "angle90.0",
+    "L": "angle270.0",
+    "400Hz": ("400Hz", "4e+02Hz"),  # OR
+    "R_gammatone": ["angle90.0", "gammatone"],  # AND
+    "L_400Hz": ["angle90.0", ("400Hz", "4e+02Hz")],  # AND + OR
+        } 
+
+    ->
+
+    {'R': ['gammatone_4e+02Hz_79Pa-1pi_2.7ms2-1pi_angle90.0',
+          'gammatone_8e+02Hz_79Pa-1pi_2.7ms2-1pi_angle90.0',
+          'gammatone_1.2e+03Hz_79Pa-1pi_2.7ms2-1pi_angle90.0',
+          'tone_0.9s_400Hz_22PaMonopoleWave2D_distance0.03m_angle90.0',
+          'tone_0.9s_800Hz_22PaMonopoleWave2D_distance0.03m_angle90.0',
+          'tone_0.9s_1200Hz_22PaMonopoleWave2D_distance0.03m_angle90.0'],
+    'L': ['gammatone_4e+02Hz_79Pa-1pi_2.7ms2-1pi_angle270.0',
+          'gammatone_8e+02Hz_79Pa-1pi_2.7ms2-1pi_angle270.0',
+          'gammatone_1.2e+03Hz_79Pa-1pi_2.7ms2-1pi_angle270.0',
+          'tone_0.9s_400Hz_22PaMonopoleWave2D_distance0.03m_angle270.0',
+          'tone_0.9s_800Hz_22PaMonopoleWave2D_distance0.03m_angle270.0',
+          'tone_0.9s_1200Hz_22PaMonopoleWave2D_distance0.03m_angle270.0'],
+     '400Hz': ['gammatone_4e+02Hz_79Pa-1pi_2.7ms2-1pi_angle90.0',
+              'gammatone_4e+02Hz_79Pa-1pi_2.7ms2-1pi_angle270.0',
+              'tone_0.9s_400Hz_22PaMonopoleWave2D_distance0.03m_angle90.0',
+              'tone_0.9s_400Hz_22PaMonopoleWave2D_distance0.03m_angle270.0'],
+     'R_gammatone': ['gammatone_4e+02Hz_79Pa-1pi_2.7ms2-1pi_angle90.0',
+                     'gammatone_8e+02Hz_79Pa-1pi_2.7ms2-1pi_angle90.0',
+                     'gammatone_1.2e+03Hz_79Pa-1pi_2.7ms2-1pi_angle90.0'],
+                     'L_400Hz': ['gammatone_4e+02Hz_79Pa-1pi_2.7ms2-1pi_angle90.0',
+                     'tone_0.9s_400Hz_22PaMonopoleWave2D_distance0.03m_angle90.0']}
+    """
+    
+    def match(name, cond):
+        # cond can be str, tuple, or list
+        if isinstance(cond, str):
+            return cond in name
+        elif isinstance(cond, tuple):
+            # OR logic
+            return any(match(name, c) for c in cond)
+        elif isinstance(cond, list):
+            # AND logic
+            return all(match(name, c) for c in cond)
+        return False
+
+    result = {}
+    for key, cond in combospec.items():
+        result[key] = [stim_names[i] for i in stim_names if match(stim_names[i], cond)]
+    return result
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

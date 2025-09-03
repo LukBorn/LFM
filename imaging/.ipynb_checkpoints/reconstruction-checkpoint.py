@@ -221,23 +221,23 @@ def reconstruct_vols_from_imgs_parallel(paths,
     reader = VolumeReader(paths.raw, 'data', i_frames=read_idx, prefetch=2*n_gpus, verbose=(verbose >= 2))
 
     writer = AsyncH5Writer(save_fn, verbose=(verbose >= 2))
-    writer.write_meta('deconvolution_params', {'OTF': otf_path,
-                                                'roi_size': roi_size,
-                                                'max_iter': max_iter,
-                                                'xy_pad': xy_pad,
-                                                'loss_threshold': loss_threshold,
-                                                'reuse_prev_vol': reuse_prev_vol,
-                                                'img_subtract_bg': img_subtract_bg,
-                                                'img_mask': img_mask,
-                                                'psf_downsample': psf_downsample,
-                                                'OTF_normalize': OTF_normalize,
-                                                'OTF_clip': OTF_clip,
-                                                'crop': crop,
-                                                'out_crop': out_crop,
-                                                'vmin': vmin,
-                                                'vmax': vmax,
-                                                'absolute_limits': absolute_limits,
-                                                'transpose': transpose,
+    writer.write_meta('deconvolution_params', {'roi_size': roi_size,
+                                               'max_iter': max_iter,
+                                               'xy_pad': xy_pad,
+                                               'loss_threshold': loss_threshold,
+                                               'reuse_prev_vol': reuse_prev_vol,
+                                               'img_subtract_bg': img_subtract_bg,
+                                               'img_normalize': img_normalize,
+                                               'img_mask': img_mask,
+                                               'psf_downsample': psf_downsample,
+                                               'OTF_normalize': OTF_normalize,
+                                               'OTF_clip': OTF_clip,
+                                               'crop': crop,
+                                               'out_crop': out_crop,
+                                               'vmin': vmin,
+                                               'vmax': vmax,
+                                               'absolute_limits': absolute_limits,
+                                               'transpose': transpose,
                                                 })
     writer.create_dataset('data', shape=(reader.len, size_z, out_crop[1]-out_crop[0], out_crop[3]-out_crop[2]), dtype=np.float32)
     writer.create_dataset('losses', shape=(reader.len, max_iter), dtype=np.float32)
@@ -279,7 +279,7 @@ def reconstruct_vols_from_imgs_parallel(paths,
             if img_normalize: img /= img.mean(dtype=cp.float32)
             if img_subtract_bg: img -= self.bg
             if img_mask: img *= self.mask
-            
+
             self.img_padded[xy_pad:-xy_pad, xy_pad:-xy_pad] = img
 
             self.obj_recon = cp.asarray(init_volume_manager.get()).copy()
@@ -379,10 +379,10 @@ def reconstruct_vols_from_imgs_parallel(paths,
                 if write_mip_video:
                     mip = create_projection_image(obj_recon, projection=projection, slice_idx=slice_idx,
                                                   vmin=vmin, vmax=vmax, absolute_limits=absolute_limits, transpose=transpose,
-                                                  text=f"{frame_n}, {iter}", scalebar=200, zpos=zpos,text_size=3,)
+                                                  text=f"{frame_n}", scalebar=200, zpos=zpos,text_size=3,)
                     video_writer.write(mip, frame_n)
                 init_volume_manager.update(obj_recon, frame_n)
-                processed_indeces.append(frame_n)
+                processed_indeces.append(frame_n) 
         except Exception as e:
             print(f"Error in GPU worker {gpu_id}: \n{traceback.format_exc()}")
             nonlocal failed_gpus

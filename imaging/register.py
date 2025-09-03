@@ -11,7 +11,8 @@ import threading
 import time, os
 from skimage.metrics import structural_similarity as ssim
 from cupyx.scipy.ndimage import median_filter, maximum_filter
-from signal_extraction import NeighborhoodCovMapper, NeighborhoodCorrMapper
+from signal_extraction import NeighborhoodCovMapper, NeighborhoodCorrMapper, extract_traces_voxels
+from daio.h5 import lazyh5
 
 def average_volumes(paths,
                     ref_idx =[100,120,1],
@@ -208,10 +209,10 @@ def register_recording(paths):
         
         writer.write("warpfields", warpfield.warp_field.get(), frame_n)
         writer.write("data", registered_vol.get(), frame_n)
-        metrics = np.array(calculate_metrics(ref_vol, registered_vol, verbose=False))
-        writer.write("metrics", metrics, frame_n)
+        r, mse, corr = np.array(calculate_metrics(ref_vol, registered_vol, verbose=False))
+        writer.write("metrics", (r,mse,corr), frame_n)
 
-        if metrics[0] > r_threshold:
+        if r > r_threshold:
             cov_mapper.step(registered_vol)
             corr_mapper.step(registered_vol)
             corr_mapper_2.step(registered_vol)
@@ -219,15 +220,15 @@ def register_recording(paths):
         if vid_params["write_video"]:
             mip = create_projection_image(registered_vol, 
                                           vmax=vid_params["vid"]["vmax"], vmin=vid_params["vid"]["vmin"], absolute_limits=vid_params["vid"]["absolute_limits"],
-                                          zpos=vid_params["zpos"], scalebar=vid_params["scalebar"], text=f"f{frame_n}",transpose=vid_params["transpose"])
+                                          zpos=np.array(vid_params["zpos"]), scalebar=vid_params["scalebar"], text=f"f{frame_n}",transpose=vid_params["transpose"])
             video_writer.write(mip, frame_n)
         
         if vid_params["write_dff_video"]:
             average_vol = (1/vid_params["dff"]["tau"]) * registered_vol+ (1-1/vid_params["dff"]["tau"]) * average_vol
-            dff_vol = (registered_vol - average_vol) / average_vol
+            dff_vol = (registered_vol - average_vol)
             dff_mip = create_projection_image(dff_vol,
                                               vmax=vid_params["dff"]["vmax"], vmin=vid_params["dff"]["vmin"], absolute_limits=vid_params["dff"]["absolute_limits"],
-                                              zpos=vid_params["zpos"], scalebar=vid_params["scalebar"], text=f"f{frame_n}",transpose=vid_params["transpose"])
+                                              zpos=np.array(vid_params["zpos"]), scalebar=vid_params["scalebar"], text=f"f{frame_n}",transpose=vid_params["transpose"])
             dff_video_writer.write(dff_mip, frame_n)
     cov_map, var_map = cov_mapper.retrieve()
     writer.write_dataset('cov_map', cov_map)
@@ -241,7 +242,50 @@ def register_recording(paths):
         dff_video_writer.close()
 
 
+def segment(paths,
+            z_crop=(10,-10)
+            n_traces = 200000,
+            fn_add = "",
+            step=0.000005, 
+            voxel_size=[3,2,2],):
+    assert os.path.exists(paths.registered), "must be registered"
+    reg = lazyh5(paths.registered)
+    cov_map = reg["cov_map"]
+    cov_map_dwn = cov_map[z_crop[0]:zcrop[1]:voxel_size[0],::voxel_size[1],::voxel_size[2]]
+    brightness_threshold = 0
+    while n_voxels < n_traces:
+        brightness_threshold += step
+        n_voxels = cov_map_dwn[cov_map_dwn >= brightness_threshold].flatten().shape[0]
+    voxel_coords=(np.argwhere(cov_map_dwn>= brightness_threshold)*voxel_size + [z_crop[0],0,0])
+    labels = np.zeros_like(cov_map, dtype = np.uint32)
+    for i in tqdm(range(n_voxels)):
+        coords = voxel_coords[i]
+        labels[max(coords[0]-voxel_size[0]//2, 0):min(cov_map.shape[0],coords[0]+voxel_size[0]//2+voxel_size[0]%2),
+               max(coords[1]-voxel_size[1]//2, 0):min(cov_map.shape[1],coords[1]+voxel_size[1]//2+voxel_size[1]%2),
+               max(coords[2]-voxel_size[2]//2, 0):min(cov_map.shape[2],coords[2]+voxel_size[2]//2+voxel_size[2]%2)] = i+1
+    fn_seg = paths.segmentation[:-3]+fn_add+".h5"
+    with h5py.File(fn_seg, "w") as f:
+        f.create_dataset("segmentation", data=labels)
+    return fn_seg
+    
 
+def register_segment_extract(paths, 
+                             z_crop = (10,-10),
+                             n_traces = 200000,
+                            fn_add = "",
+                            step=0.000001, 
+                            voxel_size=[3,2,2],
+                            ):
+    register_recording(paths)
+    fn_segmentation = segment(paths, 
+                              n_traces = 200000,
+                            fn_add = "",
+                            step=0.000001, 
+                            voxel_size=[3,2,2],)
+    paths.segmentation = fn_segmentation
+    paths.traces = paths.traces[:-3]+fn_add+".h5"
+    extract_traces_voxles(paths,voxel_size=voxel_size)
+    
 
 
 def registered_volume_reader(paths, idx=None):

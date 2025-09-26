@@ -176,11 +176,13 @@ def reconstruct_vols_from_imgs_parallel(paths,
     if img_idx is None:
         with h5py.File(paths.raw, 'r') as f:
             img_idx = (0, f["data"].shape[0], 1)
+            timestamps = f["tstmp"]
         save_fn = paths.deconvolved
+        read_idx = np.arange(img_idx[0], img_idx[1], img_idx[2])[~np.isnan(timestamps)]
     else:
         assert len(img_idx) == 3, "img_idx must be a tuple of (start, stop, step)"
-        save_fn = paths.deconvolved[:-3]+ f"_frames{img_idx[0]}-{img_idx[1]}.h5"
-    read_idx = range(img_idx[0], img_idx[1], img_idx[2])
+        save_fn = paths.deconvolved[:-3]+ f"_frames{img_idx[0]}-{img_idx[1]}.h5"        
+        read_idx = np.arange(img_idx[0], img_idx[1], img_idx[2])
 
 
     # handle existing files
@@ -550,7 +552,7 @@ def reconstruct_vols_from_imgs(paths,
             if plot_decon:
                 plots_mip[it, iter,:,:] = create_projection_image(obj_recon, projection=projection, slice_idx=slice_idx,
                                                                   vmin=vmin, vmax=vmax, absolute_limits=absolute_limits, transpose=transpose,
-                                                                  text=f"{frame_n}, {iter}", scalebar=200, zpos=zpos,text_size=3,)
+                                                                  scalebar=200, zpos=zpos,text_size=3)#,text=f"{frame_n}, {iter}")
 
            #calculate loss
             ratio_ = ratio_img[xy_pad:-xy_pad, xy_pad:-xy_pad]

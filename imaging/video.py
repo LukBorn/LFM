@@ -244,6 +244,7 @@ def create_projection_image(volume,
                             scalebar=200, 
                             zpos=None,
                             transpose=False,
+                            for_heatmap=False,
                             gpu=True):
     """
     Creates a 2D image showing projections of a 3D volume along all three axes.
@@ -291,7 +292,7 @@ def create_projection_image(volume,
 
     # Calculate output dimensions with padding
     output_height = height + depth + 3 * pad
-    output_width = width + depth + 3 * pad
+    output_width = width + depth + 5 * pad
     output = cp.zeros((output_height, output_width), dtype=volume.dtype) if gpu else np.zeros((output_height, output_width), dtype=volume.dtype)
 
     if projection == "max":
@@ -326,7 +327,7 @@ def create_projection_image(volume,
     if text is not None:
         font, lineType = cv2.FONT_HERSHEY_PLAIN, text_size+1
         text_width, text_height = cv2.getTextSize(text, font, text_size, lineType)[0]
-        org = (output_width - pad - text_width, output_height - pad)
+        org = (output_width - 3*pad - text_width, output_height - pad)
         output = cv2.putText(output, text, 
                              org=org, 
                              fontFace=font,
@@ -359,14 +360,102 @@ def create_projection_image(volume,
                              fontScale=text_size, 
                              color = color,
                              thickness=lineType)    
-
+    if not for_heatmap:
+        output = output[:, :-2*pad]  # Remove extra padding on the right and bottom
     return output
 
-def get_clipped_array(arr, vmin=0, vmax=100, absolute_limits=False, gpu=True):
+def create_projection_image_heatmap(volume, heatmap,
+                                    projection="max",
+                                    vmin=0, vmax=100, absolute_limits=False,
+                                    heatmap_vmin = 0, heatmap_vmax=1.0,
+                                    pad=None, text=None, text_size=3,
+                                    scalebar=200, zpos=None, alpha = 0.5,
+                                    transpose=False):
+    # Get background grayscale image
+    background = create_projection_image(volume, projection=projection,
+                                        vmin=vmin, vmax=vmax, absolute_limits=absolute_limits,
+                                        pad=pad, text=text, text_size=text_size,
+                                        scalebar=scalebar, zpos=zpos,
+                                        transpose=transpose,
+                                        for_heatmap=True,
+                                        gpu=True)
+    background = background.get() if hasattr(background, "get") else background
+    background *= np.uint8(1-alpha)
+    background_rgb = cv2.cvtColor(background, cv2.COLOR_GRAY2RGB)
+
+    # Get positive and negative heatmap projections
+    pos_heatmap_proj = create_projection_image(heatmap, projection=projection,
+                                               vmin=heatmap_vmin, vmax=heatmap_vmax, absolute_limits=True,
+                                               pad=pad, text=None, text_size=text_size,
+                                               scalebar=None, zpos=None,
+                                               transpose=transpose,
+                                               for_heatmap=True,
+                                               gpu=True)
+    neg_heatmap_proj = create_projection_image(-heatmap, projection=projection,
+                                               vmin=heatmap_vmin, vmax=heatmap_vmax, absolute_limits=True,
+                                               pad=pad, text=None, text_size=text_size,
+                                               scalebar=None, zpos=None,
+                                               transpose=transpose,
+                                               for_heatmap=True,
+                                               gpu=True)
+    pos_heatmap_proj = pos_heatmap_proj.get() if hasattr(pos_heatmap_proj, "get") else pos_heatmap_proj
+    neg_heatmap_proj = neg_heatmap_proj.get() if hasattr(neg_heatmap_proj, "get") else neg_heatmap_proj
+
+    if pad is None:
+        pad = int(volume.shape[0]/10)
+
+    colorbar_shape =  int(((pos_heatmap_proj.shape[0]/2)-pad)* ((heatmap_vmax-heatmap_vmin)/heatmap_vmax)), pad
+    colorbar = np.linspace(0, 255, colorbar_shape[0]).astype(np.uint8)[:, np.newaxis]
+    pos_heatmap_proj[pad: pad + colorbar_shape[0],-2*pad:-pad,] = np.ones(shape=colorbar_shape, dtype=np.uint8) * -colorbar
+
+    neg_heatmap_proj[-(pad+colorbar_shape[0]):-pad,-2*pad:-pad,] = np.ones(shape=colorbar_shape, dtype=np.uint8) * colorbar
+
+    # Normalize to [0, 1] for alpha
+    pos_alpha = pos_heatmap_proj.astype(np.float32) / 255.0
+    neg_alpha = neg_heatmap_proj.astype(np.float32) / 255.0
+
+    # Create RGB overlays
+    overlay = background_rgb.astype(np.float32) / 255.0
+    # Red channel for positive
+    pos_mask = pos_alpha > 0
+    overlay[..., 0][pos_mask] = overlay[..., 0][pos_mask] * (1 - pos_alpha[pos_mask]) + pos_alpha[pos_mask]
+
+    # Blue channel for negative
+    neg_mask = neg_alpha > 0
+    overlay[..., 1][neg_mask] = overlay[..., 1][neg_mask] * (1 - neg_alpha[neg_mask]) + neg_alpha[neg_mask]
+    overlay[..., 2][neg_mask] = overlay[..., 2][neg_mask] * (1 - neg_alpha[neg_mask]) + neg_alpha[neg_mask]
+
+    overlay = (overlay * 255).astype(np.uint8)
+
+    # font, lineType = cv2.FONT_HERSHEY_PLAIN, text_size
+    # text_width, text_height = cv2.getTextSize(text, font, text_size, lineType)[0]
+    # colorbar_top = pad
+    # colorbar_bottom = overlay.shape[0] - pad
+    # # Top label (heatmap_vmax)
+    # cv2.putText(overlay, f"{heatmap_vmax:.2f}",
+    #             (overlay.shape[1] - int(2.5*pad), pad -3),
+    #             font, 1, (255,255,255,255), lineType)
+    
+
+    # # Bottom label (-heatmap_vmax)
+    # cv2.putText(overlay, f"{-heatmap_vmax:.2f}",
+    #             (overlay.shape[1] - 3*pad, overlay.shape[0]-3),
+    #             font, 1, (255,255,255,255), lineType)
+
+    
+    return overlay
+
+def get_clipped_array(arr, vmin=0, vmax=100, absolute_limits=False, gpu=True, dtype="uint8"):
     if gpu:
         arr = cp.asarray(arr)
     elif isinstance(arr, cp.ndarray):
         arr = arr.get()  
+    if dtype == "uint8":
+        dtype = np.uint8 if not gpu else cp.uint8
+        max_val = 255
+    elif dtype == "uint16":
+        dtype = np.uint16 if not gpu else cp.uint16
+        max_val = 65535
     if not absolute_limits:
         # Normalize to percentiles (linear interpolation between min and max)
         arr_min = arr.min()

@@ -14,6 +14,7 @@ import os, json
 import numpy as np
 from collections import defaultdict
 from daio.h5 import lazyh5
+import warpfield
 
 
 class Paths():
@@ -207,6 +208,123 @@ class VolumeReader:
                 yield item
  
 
+class RegisteredVolumeReader:
+    """
+    Iterable. Lazily loads volumes and warpfields, applies warpfield to each volume.
+    Args:
+        paths: Paths object
+        idx: indices to read
+        prefetch: number of frames to prefetch
+        gpu: if True, use cupy for warpfield application, else numpy
+    """
+
+    def __init__(self, paths, i_frames=None,mask=1, prefetch=1, gpu=True, verbose=False):
+        self.paths = paths
+        if i_frames is None:
+            with h5py.File(self.paths.deconvolved, 'r') as f_in:
+                i_frames = range(len(f_in["data"]))
+        self.i_frames = list(i_frames)
+        
+        self.prefetch = prefetch
+        self.gpu = gpu
+        if self.gpu:
+            self.mask = cp.asarray(mask)
+        else: 
+            self.mask = np.array(mask)
+        self.verbose = verbose
+
+        # Read metadata needed for WarpField construction
+        with h5py.File(paths.registered, 'r') as f:
+            self.block_size = f['block_size'][()]
+            self.block_stride = f['block_stride'][()]
+        with h5py.File(paths.reg_recipe, 'r') as f:
+            self.crop = f['crop'][()]
+
+        self.vol_reader = VolumeReader(paths.deconvolved, key='data', i_frames=i_frames, prefetch=prefetch)
+        self.warpfield_reader = VolumeReader(paths.registered, key='warpfields', i_frames=i_frames, prefetch=prefetch)
+        self.volshape = self.vol_reader.get_shape("data")[1],self.crop[1]-self.crop[0], self.crop[3]-self.crop[2]
+
+        
+        self.len = len(self.vol_reader)
+        self._lock = threading.Lock()
+        self._gen = self._registered_volume_gen()
+        self.finished = False
+
+    def _apply_warp(self, item):
+        (frame_n, vol), (_, warp_data) = item
+        if self.gpu:
+            warp_field = warpfield.register.WarpMap(
+                warp_field=cp.asarray(warp_data),
+                block_size=self.block_size,
+                block_stride=self.block_stride,
+                ref_shape=self.volshape,
+                mov_shape=self.volshape
+            )
+            vol_cp = cp.asarray(vol)[:,self.crop[0]:self.crop[1], self.crop[2]:self.crop[3]]
+            warped_vol = warp_field.apply(vol_cp)
+            warped_vol *= self.mask
+            warped_vol = warped_vol.get()
+        else:
+            warp_field = warpfield.register.WarpMap(
+                warp_field=np.asarray(warp_data),
+                block_size=self.block_size,
+                block_stride=self.block_stride,
+                ref_shape=self.volshape,
+                mov_shape=self.volshape
+            )
+            vol_np = np.asarray(vol)[:,self.crop[0]:self.crop[1], self.crop[2]:self.crop[3]]
+            warped_vol = warp_field.apply(vol_np)
+            warped_vol *= self.mask
+        
+        return frame_n, warped_vol
+
+    def _registered_volume_gen(self):
+        for frame_n, warped_vol in lazymap(self._apply_warp, zip(self.vol_reader, self.warpfield_reader), prefetch=self.prefetch):
+            if self.verbose:
+                print(f"RegisteredVolumeReader: Yielding frame {frame_n}")
+            yield frame_n, warped_vol
+
+    def get_next(self):
+        """Thread-safe: Get the next item from the generator, returns None after exhaustion."""
+        with self._lock:
+            if self.finished:
+                return None
+            try:
+                return next(self._gen)
+            except StopIteration:
+                self.finished = True
+                return None
+
+    def __next__(self):
+        with self._lock:
+            if self.finished:
+                raise StopIteration
+            try:
+                item = next(self._gen)
+                return item
+            except StopIteration:
+                self.finished = True
+                raise StopIteration
+
+    def __len__(self):
+        return self.len
+
+    def __iter__(self):
+        return self
+
+    def __del__(self):
+        try:
+            if hasattr(self, '_gen'):
+                self._gen = None
+            if hasattr(self, '_lock'):
+                self._lock = None
+        except Exception:
+            pass
+
+    def get_shape(self):
+        """Get the shape of the registered volume output."""
+        # Output shape is the same as the input volume shape
+        return (self.len, *self.volshape)
 
 
 def expandhome(path):
@@ -226,29 +344,29 @@ class AsyncH5Writer:
         self._lock = threading.Lock()
         self.verbose = verbose
 
-    def create_dataset(self, name, shape, dtype=np.float32, **kwargs):
+    def create_dataset(self, name, shape, dtype=np.float32, compression="gzip", **kwargs):
         with h5py.File(self.filepath, 'a') as f:
             if name not in f:
-                dset = f.create_dataset(name, shape=shape, dtype=dtype, **kwargs)
+                dset = f.create_dataset(name, shape=shape, dtype=dtype, compression=compression, **kwargs)
             else:
                 dset = f[name]
             with self._lock:
                 self._datasets[name] = dset.shape
     
-    def write_dataset(self, name, data):
+    def write_dataset(self, name, data, **kwargs):
         """Write a complete dataset to the file."""
         with h5py.File(self.filepath, 'a') as f:
             if isinstance(data, (str, bytes)):
                 # Use string dtype for HDF5
                 dt = h5py.string_dtype(encoding='utf-8') if isinstance(data, str) else 'S'
                 if name not in f:
-                    f.create_dataset(name, data=data, dtype=dt)
+                    f.create_dataset(name, data=data, dtype=dt, **kwargs)
                 else:
                     f[name][...] = data
                 self._write_queue.put(('data', name, slice(None), np.array(data)))
             else:
                 if name not in f:
-                    f.create_dataset(name, shape=data.shape, dtype=data.dtype)
+                    f.create_dataset(name, shape=data.shape, dtype=data.dtype, **kwargs)
                 self._write_queue.put(('data', name, slice(None), np.array(data)))
 
     def write(self, dataset_name, data, index):
@@ -428,11 +546,15 @@ def get_available_gpus(verbose= True):
         return 1  # Fallback
 
 
-def get_stimulus(path, fps=40, combinations={}):
-
+def get_stimulus(path, timestamps, fps=40, lag_frames=3, combinations={}):
+    #path: path to the folder containing stimulus assembly and stimdata_conditioned
+    #timestamps: lazyh5(paths.raw)["tstmp"] of the recording to do this for
+    #fps: fps of redording to do this for
+    #lag frames: the number of frames the camera is behind the daq card
 
     stim_data = lazyh5(os.path.expanduser(os.path.join(path, "stimdata_conditioned.h5")))
     samplerate = stim_data["spec"]["samplerate"]
+    samplerate = 50000
     reverb_time = int(stim_data["spec"]["reverb_period"] * samplerate)
 
     stimdict = {}
@@ -447,28 +569,40 @@ def get_stimulus(path, fps=40, combinations={}):
     stimulus_sequence_order = stim_json.get('stimulus_sequence_order', [])
     assembly_info = stim_json.get('assembly_info', [])
     total_duration = stim_json.get("assembly_duration", [])
-    final_stimulus = np.zeros(int(total_duration * samplerate))
-    final_stimulus_id = np.zeros(int(total_duration * samplerate))
+    final_stimulus = np.zeros(int(len(timestamps)/fps * samplerate))
+    final_stimulus_id = np.zeros(int(len(timestamps)/fps * samplerate))
 
     for i, event_info in enumerate(assembly_info):
         stim_id = stimulus_sequence_order[i]
         if stim_id != 0:
             stim = stimdict[stim_id]
-            if stim.shape[0]> 2*reverb_time:
-                onset_time = round(event_info.get('onset') * samplerate)
-                offset_time = round(event_info.get('offset') * samplerate)
-                final_stimulus[onset_time:offset_time] = stim[reverb_time:-reverb_time]
-                final_stimulus_id[onset_time:offset_time] = stim_id
-            else:
-                onset_time = round(event_info.get('onset') * samplerate)
-                offset_time = onset_time+stim[reverb_time:].shape[0]
-                final_stimulus[onset_time:offset_time] = stim[reverb_time:]
-                final_stimulus_id[onset_time:offset_time] = stim_id
-
-    final_stimulus_id = downsample_max(final_stimulus_id, samplerate, fps)
-    # trace_mask is not defined in your prompt, so use the same length as final_stimulus_id
-    final_stimulus_id_fps = np.zeros_like(final_stimulus_id, dtype=np.uint8)
-    final_stimulus_id_fps[:final_stimulus_id.shape[0]] = final_stimulus_id
+            onset_time = round(event_info.get('stimulus_period_onset') * samplerate)
+            # if stim.shape[0]> 2*reverb_time:
+            #     offset_time = round(event_info.get('offset') * samplerate)
+            #     final_stimulus[onset_time:offset_time] = stim[reverb_time:-reverb_time]
+            #     final_stimulus_id[onset_time:offset_time] = stim_id
+            # else:
+            offset_time = onset_time+stim[reverb_time:].shape[0]
+            final_stimulus[onset_time:offset_time] = stim[reverb_time:]
+            final_stimulus_id[onset_time:offset_time] = stim_id
+    # timestamps = timestamps[~np.isnan(timestamps)]
+    timestamps -= np.nanmin(timestamps)
+    stim_time = np.arange(final_stimulus_id.shape[0])/samplerate 
+    final_stimulus_id_fps = np.zeros_like(timestamps)
+    for i in range(len(timestamps)):
+        t0 = timestamps[i-1] if i>0 else 0
+        t1 = timestamps[i]
+    
+        idx0 = np.searchsorted(stim_time, t0, side='left')
+        idx1 = np.searchsorted(stim_time, t1, side='right')
+        stim_ids_in_window = final_stimulus_id[idx0:idx1]
+        if stim_ids_in_window.size == 0 or np.all(stim_ids_in_window == 0):
+            final_stimulus_id_fps[i] = 0
+        else:
+            final_stimulus_id_fps[i] = np.max(stim_ids_in_window)
+    #todo: there is a bug that makes the last few frames to 5, and not 0 as it should be
+    final_stimulus_id_fps = np.roll(final_stimulus_id_fps , -lag_frames)
+    final_stimulus_id_fps[-100:] = 0
 
     # --- Handle combinations ---
     # Reverse lookup: label -> index
@@ -491,19 +625,23 @@ def get_stimulus(path, fps=40, combinations={}):
         bool_stim[:, idx] = final_stimulus_id_fps == idx
     
     if combinations != {}:
-        stim_names[0] = "all"
+        stim_names_comb[0] = "all"
         # First row: True when not silence
         bool_stim[:, 0] = final_stimulus_id_fps != 0
-        
-        
+        label_to_indices = defaultdict(list)
+        for k, v in stim_names_comb.items():
+            label_to_indices[v].append(k)
+                
         # Combination stimuli
         for i, (comb_name, comb_labels) in enumerate(combinations.items()):
             comb_idx = len(stim_names) + i
-            indices = [label_to_idx[lbl] for lbl in comb_labels]
+            indices = []
+            for lbl in comb_labels:
+                indices.extend(label_to_indices[lbl])
             mask = np.isin(final_stimulus_id_fps, indices)
             bool_stim[:, comb_idx] = mask
 
-    return bool_stim, stim_names_comb, final_stimulus_id_fps, final_stimulus, samplerate
+    return bool_stim, stim_names_comb,  final_stimulus_id_fps, final_stimulus, samplerate
 
 def downsample_max(arr, samplerate, fps):
     window = int(samplerate / fps)

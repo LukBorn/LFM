@@ -12,6 +12,22 @@ import ast
 import IPython
 
 def get_mask_widget(volume, filepath, vmin=None, vmax=None, figsize=(8,8), mask_every=5, sigma=2.0, transpose=False):
+    """
+    For manually defining a mask for the reference volume
+    volume: volume that is displayed while
+    filepath: path to save the mask to
+    vmin, vmax, transpose: parameters for displaying the underlying volume
+    figsize: size of the widget
+    mask_every: interval of zslices to define the 2d masks for
+    sigma: size of kernel for smoothing the edges of the mask
+
+    Controls:
+    double left click: define new point
+    single left click and drag: moves nearest point. 
+        Sometimes you have to click near the point you want to move for it to register that you want to move
+    right click: delete closest point
+    """
+    
     if transpose:
         volume = volume.transpose(0,2,1)
     
@@ -157,6 +173,7 @@ def get_mask_widget(volume, filepath, vmin=None, vmax=None, figsize=(8,8), mask_
                 mask = binary_masks[z]
                 dt[z] = distance_transform_edt(mask) - distance_transform_edt(~mask)
             dt_stack = np.zeros((nz, ny, nx), dtype=np.float32)
+            print(dt_stack.shape)
             for z in range(nz):
                 if z <= mask_slices[0]:
                     dt_stack[z] = dt[mask_slices[0]]

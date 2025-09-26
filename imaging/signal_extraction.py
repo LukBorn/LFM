@@ -4,11 +4,11 @@ import cupy as cp
 from tqdm.auto import tqdm
 import h5py
 from daio.h5 import lazyh5
-from i_o import AsyncH5Writer, VolumeReader
+from i_o import AsyncH5Writer, VolumeReader, RegisteredVolumeReader
 import cupyx
 import matplotlib.pyplot as plt
 from video import get_clipped_array
-
+import cupyx.scipy.ndimage
 
 
 
@@ -242,7 +242,7 @@ def segment_old(paths,
 
     return segmentation_result, peaks_mip
 
-def extract_traces_old(paths,
+def extract_traces_opm(paths,
                     dog_sigma_low=[1.5,1.5,1.5],
                     dog_sigma_high=[4,4,4],
                     min_radius=[3,3,3],
@@ -254,9 +254,9 @@ def extract_traces_old(paths,
     assert os.path.exists(paths.registered), "recording must be registered"
     with h5py.File(paths.registered, 'r') as f:
         cov_map = cp.asarray(f["cov_map"])
-    reader = VolumeReader(paths.registered, "data")
-    cov_map_f = dogfilter_gpu(cov_map, sigma_low=dog_sigma_low, sigma_high=dog_sigma_high)
-    maxima_bool, peaks, peak_vals = findmaxima_gpu(cov_map_f, min_radius = min_radius)
+    reader = RegisteredVolumeReader(paths.registered, prefetch=10)
+    # cov_map_f = dogfilter_gpu(cov_map, sigma_low=dog_sigma_low, sigma_high=dog_sigma_high)
+    maxima_bool, peaks, peak_vals = findmaxima_gpu(cov_map, min_radius = min_radius)
 
     kernel = cp.array(soft_ball(soft_ball_kernel, soft_ball_k=soft_ball_k), 'float32')
     kernel /= kernel.sum()
@@ -278,13 +278,14 @@ def extract_traces_old(paths,
             for key, value in traces_results.items():
                 f.create_dataset(key, data=value)
     return traces_results
-import cupyx.scipy.ndimage
-def extract_traces(paths, 
+
+
+def extract_traces_old(paths, 
                    params_dict={},):
      
     
     # Initialize the video reader
-    reader = VolumeReader(paths.registered, "data", prefetch=10)
+    reader = VolumeReader(paths, "data", prefetch=10)
 
     with h5py.File(paths.segmentation, "r") as f:
         segmentation = np.array(f["segmentation"])
@@ -296,7 +297,7 @@ def extract_traces(paths,
     
     writer = AsyncH5Writer(paths.traces)
     writer.write_meta("params", params_dict)
-    writer.create_dataset("traces", shape = (reader.get_shape("data")[0], unique_labels.shape[0]), dtype = np.float32)
+    writer.create_dataset("traces", shape = (reader.get_shape[0], unique_labels.shape[0]), dtype = np.float32)
     writer.write_dataset("segmentation", segmentation)
     
     
@@ -307,12 +308,14 @@ def extract_traces(paths,
     writer.close()
 
 
-def extract_traces_voxels(paths,
+def extract_traces_1(paths,
                           voxel_size = [3,2,2],
                           params_dict={}):
-    # Initialize the video reader
-    reader = VolumeReader(paths.registered, "data", prefetch=10)
-
+    #writes every single frame into memory seperately, really slow for some reason even though writer is in its own thread
+    # Initialize the volume reader
+    reader = RegisteredVolumeReader(paths, prefetch=10)
+    # reader = VolumeReader(paths.registered, "data", prefetch = 10)
+    
     with h5py.File(paths.segmentation, "r") as f:
         segmentation = np.array(f["segmentation"])
 
@@ -324,7 +327,7 @@ def extract_traces_voxels(paths,
 
     writer = AsyncH5Writer(paths.traces)
     writer.write_meta("params", params_dict)
-    writer.create_dataset("traces", shape=(reader.get_shape("data")[0], unique_labels.shape[0]), dtype=np.float32)
+    writer.create_dataset("traces", shape=(reader.get_shape()[0], unique_labels.shape[0]), dtype=np.float32)
     writer.write_dataset("segmentation", segmentation)
 
     # Precompute a flat label array for bincount
@@ -338,6 +341,37 @@ def extract_traces_voxels(paths,
         frame_means = sums[unique_labels]/num_voxels
         writer.write("traces", frame_means.get(), i_frame)
     writer.close()
+
+
+def extract_traces(paths, voxel_size):
+    # writes everything into memory first and then into the file, way faster for some reason
+    reader = RegisteredVolumeReader(paths, prefetch = 10)
+    with h5py.File(paths.segmentation, "r") as f:
+        segmentation = np.array(f["segmentation"])
+    
+    labels_gpu = cp.asarray(segmentation)
+    unique_labels = cp.unique(labels_gpu)
+    unique_labels = unique_labels[unique_labels != 0]
+    
+    num_voxels = voxel_size[0]*voxel_size[1]*voxel_size[2]
+    
+    with h5py.File(paths.traces, "w") as f:
+        f["segmentation"] = segmentation
+    
+    traces = np.zeros(shape=(reader.get_shape()[0], unique_labels.shape[0]))
+    # Precompute a flat label array for bincount
+    flat_labels = labels_gpu.ravel()
+    for i_frame, vol in tqdm(reader, desc="Extracting sum traces"):
+        vol_gpu = cp.asarray(vol)
+        flat_vol = vol_gpu.ravel()
+        # bincount will sum values for each label
+        sums = cp.bincount(flat_labels, weights=flat_vol, minlength=unique_labels.max() + 1)
+        # Only keep nonzero labels (skip background)
+        frame_means = sums[unique_labels]/num_voxels
+        traces[i_frame]=frame_means.get() 
+    with h5py.File(paths.traces, "w") as f:
+        f["traces"] = traces
+    print("finished")
     
 def create_projection_image_with_peaks(volume, peaks,
                                       projection="max", 
@@ -630,9 +664,10 @@ def peristimulus_histogram(traces, stim, pad=10, align_to='onset'):
     max_len = np.max(stim_lengths)
 
     # Prepare output
+    # out = np.full((n_stimuli, n_cells, 2*pad+max_len, len(offsets)), np.nan)
     out = np.full((n_stimuli, n_cells, 2*pad+max_len, 2), np.nan)
 
-    for stim_idx in tqdm(range(n_stimuli), desc="Calculating correlation with stimulus"):
+    for stim_idx in tqdm(range(n_stimuli), desc="Calculating average trace"):
         o, f = onsets[stim_idx], offsets[stim_idx]
         if len(f) < len(o):
             f = np.append(f, n_time)
@@ -648,9 +683,11 @@ def peristimulus_histogram(traces, stim, pad=10, align_to='onset'):
                 # Bounds check
                 if start < 0 or end > n_time:
                     continue
+                seg = traces[start:end,cell] 
                 aligned.append(seg)
             if aligned:
                 arr = np.stack(aligned)
+                # out[stim_idx, cell, :, :] = arr
                 out[stim_idx, cell, :, 0] = arr.mean(0)
                 out[stim_idx, cell, :, 1] = arr.std(0)
     return out

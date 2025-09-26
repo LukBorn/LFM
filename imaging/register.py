@@ -11,7 +11,7 @@ import threading
 import time, os
 from skimage.metrics import structural_similarity as ssim
 from cupyx.scipy.ndimage import median_filter, maximum_filter
-from signal_extraction import NeighborhoodCovMapper, NeighborhoodCorrMapper, extract_traces_voxels
+from signal_extraction import NeighborhoodCovMapper, NeighborhoodCorrMapper, extract_traces
 from daio.h5 import lazyh5
 
 def average_volumes(paths,
@@ -179,8 +179,8 @@ def register_recording(paths):
     
     testvol, testwarp, _ = register_volumes(ref_vol, ref_vol, recipe)
 
-    writer = AsyncH5Writer(paths.registered)
-    writer.create_dataset('data', shape=(reader.len, *testvol.shape), dtype=np.float32)
+    writer = AsyncH5Writer(paths.registered, verbose=True)
+    # writer.create_dataset('data', shape=(reader.len, *testvol.shape), dtype=np.float32)
     writer.create_dataset('warpfields', shape=(reader.len, *testwarp.warp_field.shape), dtype=np.float32)
     writer.write_dataset('block_size', testwarp.block_size.get())
     writer.write_dataset('block_stride', testwarp.block_stride.get())
@@ -208,7 +208,7 @@ def register_recording(paths):
         registered_vol *= reg_mask
         
         writer.write("warpfields", warpfield.warp_field.get(), frame_n)
-        writer.write("data", registered_vol.get(), frame_n)
+        # writer.write("data", registered_vol.get(), frame_n)
         r, mse, corr = np.array(calculate_metrics(ref_vol, registered_vol, verbose=False))
         writer.write("metrics", (r,mse,corr), frame_n)
 
@@ -243,19 +243,22 @@ def register_recording(paths):
 
 
 def segment(paths,
-            z_crop=(10,-10)
+            z_crop=(10,-10),
             n_traces = 200000,
             fn_add = "",
             step=0.000005, 
-            voxel_size=[3,2,2],):
+            voxel_size=[3,2,2],
+           save = True):
     assert os.path.exists(paths.registered), "must be registered"
     reg = lazyh5(paths.registered)
     cov_map = reg["cov_map"]
-    cov_map_dwn = cov_map[z_crop[0]:zcrop[1]:voxel_size[0],::voxel_size[1],::voxel_size[2]]
+    cov_map_dwn = cov_map[z_crop[0]:z_crop[1]:voxel_size[0],::voxel_size[1],::voxel_size[2]]
     brightness_threshold = 0
-    while n_voxels < n_traces:
+    n_voxels = 1e16
+    while n_voxels > n_traces:
         brightness_threshold += step
         n_voxels = cov_map_dwn[cov_map_dwn >= brightness_threshold].flatten().shape[0]
+    print(brightness_threshold, n_voxels)
     voxel_coords=(np.argwhere(cov_map_dwn>= brightness_threshold)*voxel_size + [z_crop[0],0,0])
     labels = np.zeros_like(cov_map, dtype = np.uint32)
     for i in tqdm(range(n_voxels)):
@@ -264,9 +267,10 @@ def segment(paths,
                max(coords[1]-voxel_size[1]//2, 0):min(cov_map.shape[1],coords[1]+voxel_size[1]//2+voxel_size[1]%2),
                max(coords[2]-voxel_size[2]//2, 0):min(cov_map.shape[2],coords[2]+voxel_size[2]//2+voxel_size[2]%2)] = i+1
     fn_seg = paths.segmentation[:-3]+fn_add+".h5"
-    with h5py.File(fn_seg, "w") as f:
-        f.create_dataset("segmentation", data=labels)
-    return fn_seg
+    if save:
+        with h5py.File(fn_seg, "w") as f:
+            f.create_dataset("segmentation", data=labels)
+    return labels, fn_seg
     
 
 def register_segment_extract(paths, 
@@ -278,44 +282,14 @@ def register_segment_extract(paths,
                             ):
     register_recording(paths)
     fn_segmentation = segment(paths, 
-                              n_traces = 200000,
+                              n_traces = 220000,
                             fn_add = "",
                             step=0.000001, 
                             voxel_size=[3,2,2],)
     paths.segmentation = fn_segmentation
     paths.traces = paths.traces[:-3]+fn_add+".h5"
-    extract_traces_voxles(paths,voxel_size=voxel_size)
+    extract_traces(paths,voxel_size=voxel_size)
     
-
-
-def registered_volume_reader(paths, idx=None):
-    vol_reader = VolumeReader(paths.deconvolved, key='data', i_frames=idx)
-    warpfield_reader = VolumeReader(paths.registered, key='warpfields', i_frames=idx)
-    volshape = vol_reader.get_shape("data")[1:]
-    
-    # Read metadata needed for WarpField construction
-    with h5py.File(paths.registered, 'r') as f:
-        block_size = f['block_size'][()]
-        block_stride = f['block_stride'][()]
-    
-    warp_field = warpfield.register.WarpMap(
-            warp_field=[],
-            block_size= block_size,
-            block_stride = block_stride,
-            ref_shape = volshape,
-            mov_shape = volshape
-        )
-    
-    for (frame_n, vol), (_, warp_data) in zip(vol_reader, warpfield_reader):
-        # Construct WarpField object from saved data
-        
-        warp_field.warp_field = cp.asarray(warp_data)
-        # Apply warpfield to volume
-        vol_cp = cp.asarray(vol)
-        warped_vol = warp_field.apply(vol_cp)
-        
-        yield frame_n, warped_vol.get() 
-
 
 
 def save_register_recipe(paths, recipe, ref_vol, crop, vid_params=None, eye_mask=None, cov_tau=60, r_threshold=0.8):

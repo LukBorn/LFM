@@ -753,6 +753,7 @@ def showvid(filename, width=600, embed=False, loop=True):
 
 
 def rawh5_to_video(paths,
+                   img_idx = None,
                    df=True,
                    stim_labels=None,
                    fps=40,
@@ -767,8 +768,10 @@ def rawh5_to_video(paths,
                    df_bitrate= 10000000,
                   ):
     
-    reader = VolumeReader(paths.raw, "data")
-    
+    if img_idx is None:
+        reader = VolumeReader(paths.raw, "data")
+    else:
+        reader = VolumeReader(paths.raw, "data", i_frames = np.arange(img_idx[0], img_idx[1], img_idx[2]))
     outpath = os.path.join(paths.pn_outrec, f"{paths.dataset_name}_raw_vid_vmax{vmax}.mp4")
     video_writer = AVWriter2(outpath, fps=fps, expected_indeces=reader.i_frames, verbose=False, bit_rate=bitrate)
     

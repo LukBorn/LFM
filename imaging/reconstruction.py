@@ -176,7 +176,7 @@ def reconstruct_vols_from_imgs_parallel(paths,
     if img_idx is None:
         with h5py.File(paths.raw, 'r') as f:
             img_idx = (0, f["data"].shape[0], 1)
-            timestamps = f["tstmp"]
+            timestamps = np.array(f["tstmp"])
         save_fn = paths.deconvolved
         read_idx = np.arange(img_idx[0], img_idx[1], img_idx[2])[~np.isnan(timestamps)]
     else:
